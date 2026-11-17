@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no, shrink-to-fit=no">
+<title>Cube Dash - Level builder beta</title>
+<link rel="stylesheet" href="assets/css/app.css">
+</head>
+<body>
+<div id="wrap">
+  <div class="title-bar"><div class="title-stripes"></div><span class="title-text">Cube Dash</span><span class="title-meta">LEVEL BUILDER</span></div>
+  <div class="window-content">
+  <div class="tabs">
+    <button id="tab-play" class="tab on" type="button">PLAY</button>
+    <button id="tab-levels" class="tab" type="button">LEVELS</button>
+    <button id="tab-edit" class="tab" type="button">EDITOR</button>
+  </div>
+  <div id="msg"></div>
+
+  <div id="view-play">
+    <canvas id="game" width="1138" height="640"></canvas>
+    <button id="hold" type="button">HOLD TO JUMP / FLY</button>
+    <div class="row">
+      <button id="btn-play" type="button">RESTART</button>
+      <button id="btn-demo" type="button">DEMO RUN</button>
+      <button id="btn-level" type="button">NEXT LEVEL</button>
+      <button id="btn-zoom-out" type="button">ZOOM -</button>
+      <button id="btn-zoom-in" type="button">ZOOM +</button>
+    </div>
+    <p class="note">Desktop: Space jumps or flies. Speed portals change the run speed, pads and orbs launch you, slopes are walkable.</p>
+  </div>
+
+  <div id="view-levels" style="display:none">
+    <div id="level-list"></div>
+    <p class="note">Official levels are the 21 RobTop levels from the Lollipop mod. Each one is decoded when you pick it. Built-in levels come first.</p>
+  </div>
+  <div id="view-edit" style="display:none">
+    <canvas id="editor" width="1138" height="640"></canvas>
+    <div class="row">
+      <button id="pan-left" type="button">LEFT</button>
+      <button id="pan-up" type="button">UP</button>
+      <button id="pan-down" type="button">DOWN</button>
+      <button id="pan-right" type="button">RIGHT</button>
+      <button id="btn-zoom-out-e" type="button" onclick="CubeDashDebug.setTab('edit')" style="display:none"></button>
+      <button id="btn-test" type="button">TEST PLAY</button>
+    </div>
+    <div id="tools" class="row"></div>
+    <div class="row">
+      <button id="btn-import" type="button">IMPORT</button>
+      <button id="btn-export-code" type="button">EXPORT CODE</button>
+      <button id="btn-export-z" type="button">EXPORT COMPRESSED</button>
+      <button id="btn-export-gmd" type="button">EXPORT .GMD</button>
+      <button id="btn-undo" type="button">UNDO</button>
+      <button id="btn-redo" type="button">REDO</button>
+      <button id="btn-clear" type="button">CLEAR</button>
+      <button id="btn-reset" type="button">RESTORE DEMO</button>
+    </div>
+    <div class="row"><input id="gmd-file" type="file" accept=".gmd,.txt"></div>
+    <div class="row"><label class="note"><input id="deco-convert" type="checkbox"> Turn solid decorations into blocks on import</label></div>
+    <textarea id="io" placeholder="Paste a level string, a .gmd file's text, or level code here, then press IMPORT. Exports appear here too."></textarea>
+    <p class="note">Import accepts GD .gmd files (open them in a text editor and paste, or choose the file above), compressed level strings, and the level code shown by EXPORT CODE. Unsupported GD objects are skipped and listed.</p>
+  </div>
+  </div>
+</div>
+<script src="assets/js/lib/pako.js"></script>
+<script src="assets/js/data/objdefs.js?v=6"></script>
+<script src="assets/js/data/wd-colliders.js?v=1"></script>
+<script src="assets/js/data/sheets.js?v=6"></script>
+<script src="assets/js/data/frames.js?v=6"></script>
+<script src="assets/js/data/glow.js?v=1"></script>
+<script src="assets/js/sim.js?v=3"></script>
+<script src="assets/js/level-model.js?v=8"></script>
+<script src="assets/js/data/levels.js?v=3"></script>
+<script src="assets/js/data/decor.js?v=3"></script>
+<script src="assets/js/game.js?v=7"></script>
+</body>
+</html>
