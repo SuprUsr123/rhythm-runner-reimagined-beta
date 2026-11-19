@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no, shrink-to-fit=no">
-<title>Cube Dash - Level builder beta</title>
+<title>Rhythm Runner Reimagined</title>
 <link rel="stylesheet" href="assets/css/app.css">
 </head>
 <body>
 <div id="wrap">
-  <div class="title-bar"><div class="title-stripes"></div><span class="title-text">Cube Dash</span><span class="title-meta">LEVEL BUILDER</span></div>
+  <div class="title-bar"><div class="title-stripes"></div><span class="title-text">Rhythm Runner Reimagined</span><span class="title-meta">LEVEL BUILDER</span></div>
   <div class="window-content">
   <div class="tabs">
     <button id="tab-play" class="tab on" type="button">PLAY</button>
@@ -27,7 +27,12 @@
       <button id="btn-zoom-out" type="button">ZOOM -</button>
       <button id="btn-zoom-in" type="button">ZOOM +</button>
     </div>
-    <p class="note">Desktop: Space jumps or flies. Speed portals change the run speed, pads and orbs launch you, slopes are walkable.</p>
+    <div id="settings" role="group" aria-label="Settings">
+      <button id="set-noclip" type="button" aria-pressed="false">NOCLIP: OFF</button>
+      <button id="set-hitboxes" type="button" aria-pressed="false">HITBOXES: OFF</button>
+      <button id="set-percent" type="button" aria-pressed="true">PERCENT: ON</button>
+    </div>
+    <p class="note">Desktop: Space jumps or flies. Speed portals change the run speed, pads and orbs launch you, slopes are walkable. Noclip ignores hazards and deadly sides. Hitboxes outline the player (thick box is the outer hitbox, small box is the inner one), solids (solid line) and hazards (dashed line).</p>
   </div>
 
   <div id="view-levels" style="display:none">
@@ -41,7 +46,7 @@
       <button id="pan-up" type="button">UP</button>
       <button id="pan-down" type="button">DOWN</button>
       <button id="pan-right" type="button">RIGHT</button>
-      <button id="btn-zoom-out-e" type="button" onclick="CubeDashDebug.setTab('edit')" style="display:none"></button>
+      <button id="btn-zoom-out-e" type="button" onclick="RRDebug.setTab('edit')" style="display:none"></button>
       <button id="btn-test" type="button">TEST PLAY</button>
     </div>
     <div id="tools" class="row"></div>
@@ -62,16 +67,18 @@
   </div>
   </div>
 </div>
-<script src="assets/js/lib/pako.js"></script>
-<script src="assets/js/data/objdefs.js?v=6"></script>
-<script src="assets/js/data/wd-colliders.js?v=1"></script>
+<script src="assets/js/lib/fflate.js"></script>
+<script src="assets/js/data/objdefs.js?v=8"></script>
+<script src="assets/js/data/object-meta.js?v=1"></script>
+<script src="assets/js/data/children.js?v=4"></script>
+<script src="assets/js/data/wd-colliders.js?v=2"></script>
 <script src="assets/js/data/sheets.js?v=6"></script>
-<script src="assets/js/data/frames.js?v=6"></script>
+<script src="assets/js/data/frames.js?v=7"></script>
 <script src="assets/js/data/glow.js?v=1"></script>
-<script src="assets/js/sim.js?v=3"></script>
-<script src="assets/js/level-model.js?v=8"></script>
+<script src="assets/js/sim.js?v=5"></script>
+<script src="assets/js/level-model.js?v=13"></script>
 <script src="assets/js/data/levels.js?v=3"></script>
 <script src="assets/js/data/decor.js?v=3"></script>
-<script src="assets/js/game.js?v=7"></script>
+<script src="assets/js/game.js?v=34"></script>
 </body>
 </html>

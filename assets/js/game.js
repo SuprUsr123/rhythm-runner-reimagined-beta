@@ -48,11 +48,18 @@
   var holding = false, pressQueued = false;
   var acc = 0, lastNow = 0;
   var playCamY = 0;
-  var flyLockY = null;            // camera Y held while in a locked fly mode
+  // reference mirror-portal animation (game-scene _stepMirror: 0.4 s, pow-1.2 ease, visual flips at halfway)
+  var mirAnim = { animating: false, p: 0, from: 0, to: 0, t: 0 };
+  // reference fly ground/ceiling band animation (level.js stepGroundAnimation: 0.5 s linear)
+  var flyBand = { on: false, value: 0, from: 0, to: 0, t: 0, spanPx: 600 };
+  // reference _updateBackground accumulators: bg scroll and ground shift follow camera deltas
+  var bgScrollPx = 0, groundShiftPx = 0, prevCamPx = null;
   var demoActive = false, demoIdx = 0, prevDemoHold = 0;
   var coinsGot = {}, coinCount = 0;
   var DEFAULT_INF = { dx: 0, dy: 0, hidden: false, alpha: 1 };
   var dirty = true;
+  // settings (Web Dashers pause-menu toggles). Not persisted: localStorage is volatile on this browser.
+  var showNoclip = false, showHitboxes = false, showPercent = true;
 
   function flash(msg) { var el = document.getElementById('msg'); if (el) el.textContent = msg; }
 
@@ -62,7 +69,6 @@
     p.onGround = true; p.canJump = true;
     p2 = null;
     coinsGot = {}; coinCount = 0;
-    flyLockY = null;
     // only the blocks broken during the last run need restoring; the sim is rebuilt only if there were any
     if (brokenList.length) {
       for (var bi = 0; bi < brokenList.length; bi++) brokenList[bi].broken = false;
@@ -83,6 +89,9 @@
   }
   function resetRun() {
     restorePalette();
+    mirAnim.animating = false; mirAnim.p = 0; mirAnim.to = 0;
+    flyBand.on = false; flyBand.value = 0; flyBand.to = 0;
+    bgScrollPx = 0; groundShiftPx = 0; prevCamPx = null;
     spawn(); updatePlayCamera(true); startTriggers();
   }
 
@@ -199,8 +208,10 @@
     if (kind === 'gravToggle') { GS.gravityPortal(pl, !pl.flip, 0.5); return; }
     if (kind === 'miniOn') { GS.setMini(pl, true); return; }
     if (kind === 'miniOff') { GS.setMini(pl, false); return; }
-    if (kind === 'mirrorOn') { GS.setMirror(pl, true); return; }
-    if (kind === 'mirrorOff') { GS.setMirror(pl, false); return; }
+    // reference toggleMirror: the world flip animates over 0.4 s; the per-player mirrored flag
+    // follows at the halfway point via stepMirror's visual update
+    if (kind === 'mirrorOn') { if (pl === p) toggleMirror(true); return; }
+    if (kind === 'mirrorOff') { if (pl === p) toggleMirror(false); return; }
     if (kind === 'teleport') {
       // reference: y snaps to the exit, velocity carries over, the player leaves the ground
       // state behind, and the target is clamped to the fly ceiling of the current mode
@@ -214,24 +225,22 @@
     }
     if (kind === 'dualOn') { if (pl === p) enableDual(); return; }
     if (kind === 'dualOff') { if (pl === p) disableDual(); return; }
-    GS.setMode(pl, kind);
+    GS.setMode(pl, kind, r && r.portalY !== undefined ? r.portalY : undefined);
   }
 
   // reference camera: _updateCameraY (2x units, px)
   var CAM_LOCK_MODES = { ship: true, ufo: true, wave: true, ball: true, spider: true };
   function updatePlayCamera(snap) {
-    // fly modes lock the camera on the centre of their fly bounds (Web Dashers' flyCameraTarget), in the same 2x units
-    // as the normal follow, and ease toward it
-    if (CAM_LOCK_MODES[p.mode]) {
-      if (flyLockY === null) {
-        var fc = p.flyCeil !== undefined ? (p.flyFloor + p.flyCeil) / 2 : p.y;
-        flyLockY = Math.max(0, 2 * fc - 320 + REF_O);
-      }
-      var lt = flyLockY, lc = playCamY;
+    // fly modes lock the camera on the centre of their fly bounds (Web Dashers' flyCameraTarget),
+    // in the same 2x units as the normal follow, and ease toward it. The target is recomputed
+    // every frame from the CURRENT corridor — reference setFlyMode updates flyCameraTarget on
+    // every portal, so chained fly sections with different corridors re-lock correctly
+    if (CAM_LOCK_MODES[p.mode] && p.flyCeil !== null && p.flyCeil !== undefined) {
+      var fc = (p.flyFloor + p.flyCeil) / 2;
+      var lt = Math.max(0, 2 * fc - 320 + REF_O), lc = playCamY;
       if (snap) playCamY = lt; else playCamY = lc + (lt - lc) * 0.1;
       return;
     }
-    flyLockY = null;
     var yr = 2 * p.y;
     var cy = playCamY, T = cy;
     var A = cy - REF_O + 320;
@@ -244,6 +253,59 @@
     }
     if (T < 0) T = 0;
     if (snap) playCamY = T; else playCamY = cy + (T - cy) * 0.1;
+  }
+
+  // reference _mirrorProgress / toggleMirror / _stepMirror (game-scene.js): the world reflects
+  // around the screen centre over 0.4 s; the mirrored flag (player sprite flip) switches at the
+  // halfway point, matching the reference's visual update
+  function mirrorProgress() { return mirAnim.animating ? mirAnim.p : (p && p.mirrored ? 1 : 0); }
+  function toggleMirror(on) {
+    var cur = mirAnim.animating ? !!mirAnim.to : !!(p && p.mirrored);
+    if (cur === on) return;
+    mirAnim.from = mirrorProgress(); mirAnim.p = mirAnim.from;
+    mirAnim.to = on ? 1 : 0; mirAnim.t = 0; mirAnim.animating = true;
+  }
+  function stepMirror(dtSec) {
+    if (!mirAnim.animating) return;
+    mirAnim.t += dtSec;
+    var k = Math.min(1, mirAnim.t / 0.4);
+    var t2 = k * 2;
+    var eased = t2 < 1 ? 0.5 * Math.pow(t2, 1.2) : 1 - 0.5 * Math.pow(2 - t2, 1.2);
+    mirAnim.p = mirAnim.from + (mirAnim.to - mirAnim.from) * eased;
+    if (k >= 1) { mirAnim.p = mirAnim.to; mirAnim.animating = false; }
+    var visual = mirAnim.animating ? mirAnim.p >= 0.5 : !!mirAnim.to;
+    if (p) p.mirrored = visual;
+    if (p2) p2.mirrored = visual;
+  }
+  // reference level.js stepGroundAnimation + setFlyMode insets: entering a fly mode slides the
+  // ground band down and drops a ceiling band in from the top, over 0.5 s linear
+  function stepFlyBand(dtSec) {
+    var want = !!(p && CAM_LOCK_MODES[p.mode] && p.flyCeil !== null && p.flyCeil !== undefined);
+    if (want !== flyBand.on) {
+      flyBand.on = want;
+      flyBand.from = flyBand.value; flyBand.to = want ? 1 : 0; flyBand.t = 0;
+      if (want) flyBand.spanPx = 2 * Math.max(0, p.flyCeil - p.flyFloor);
+    }
+    if (flyBand.value !== flyBand.to) {
+      flyBand.t += dtSec;
+      var kk = Math.min(1, flyBand.t / 0.5);
+      flyBand.value = flyBand.from + (flyBand.to - flyBand.from) * kk;
+    }
+  }
+  // per-frame visual state in the reference update order: camera -> mirror step -> background
+  // scroll / ground shift -> ground band animation
+  function stepVisualAnims(dtSec) {
+    stepMirror(dtSec);
+    var camPx = 2 * (p ? p.x : 0);
+    if (prevCamPx === null) prevCamPx = camPx;
+    var dCam = camPx - prevCamPx;
+    if (dCam) {
+      var mp = mirrorProgress();
+      bgScrollPx += dCam * (1 - 2 * mp);
+      if (mp > 0) groundShiftPx += 2 * mp * dCam;
+    }
+    prevCamPx = camPx;
+    stepFlyBand(dtSec);
   }
 
   function coinKey(c) { return c.cx + ',' + c.cy; }
@@ -262,40 +324,120 @@
       if (!coinsGot[ck]) { coinsGot[ck] = true; coinCount++; }
     }
     if (r.breaks.length) {
-      for (var bk = 0; bk < r.breaks.length; bk++) { r.breaks[bk].broken = true; brokenList.push(r.breaks[bk]); }
-      LEVEL.dirty = true;                      // rebuild the sim without the broken blocks
+      var newlyBroken = false;
+      for (var bk = 0; bk < r.breaks.length; bk++) {
+        var block = r.breaks[bk];
+        // The level snapshot is reused for all four substeps in a frame. Ignore duplicate
+        // contacts after the first one has already marked this object as broken.
+        if (block && !block.broken) {
+          block.broken = true;
+          brokenList.push(block);
+          newlyBroken = true;
+        }
+      }
+      if (newlyBroken) LEVEL.dirty = true;      // rebuild the sim without the broken blocks
     }
     return r;
   }
 
   // ---- groups and triggers (gameplay subset: toggle, alpha, move, stop; spawn or touch) ----
   var groupState = {}, trigFired = {}, groupQueue = [], frameNo = 0;
+  var groupCenterCache = {}, channelPulses = [];
   var dynDirty = true, lastDynLevel = null;   // grouped objects are rebuilt only when the group state changes
   var currentGroup = 0, touchNext = false;
   function gstate(g) {
-    if (!groupState[g]) groupState[g] = { bx: 0, by: 0, tweens: [], hidden: false, alpha: 1, atw: null };
+    if (!groupState[g]) groupState[g] = { bx: 0, by: 0, tweens: [], hidden: false, alpha: 1, atw: null, rotation: 0, rotTweens: [], centerGroup: 0, lockRotation: false, pulses: [] };
     return groupState[g];
   }
   function frames(sec) { return Math.max(1, Math.round((sec || 0) * 60)); }
   function groupInfo(groups) {
-    var dx = 0, dy = 0, hidden = false, alpha = 1, k, s, j, tw, f;
+    var dx = 0, dy = 0, hidden = false, alpha = 1, rotation = 0, pivot = null, lockRotation = false, pulseTint = null;
+    var centerGroup = 0, k, s, j, tw, f;
     for (k = 0; k < groups.length; k++) {
       s = groupState[groups[k]];
       if (!s) continue;
       dx += s.bx; dy += s.by;
       for (j = 0; j < s.tweens.length; j++) {
         tw = s.tweens[j]; f = Math.min(1, tw.t / tw.dur);
+        f = easingSample(tw.easingType, tw.easingRate, f);
         dx += tw.dx * f; dy += tw.dy * f;
       }
+      rotation += s.rotation || 0;
+      if (s.centerGroup > 0) {
+        centerGroup = s.centerGroup;
+        if (groupCenterCache[s.centerGroup]) pivot = groupCenterCache[s.centerGroup];
+        lockRotation = !!s.lockRotation;
+      }
+      if (s.pulses && s.pulses.length) pulseTint = s.pulses[s.pulses.length - 1].tint || pulseTint;
       if (s.hidden) hidden = true;
       if (s.alpha < alpha) alpha = s.alpha;
     }
-    return { dx: dx, dy: dy, hidden: hidden, alpha: alpha };
+    return { dx: dx, dy: dy, hidden: hidden, alpha: alpha, rotation: rotation, pivot: pivot, centerGroup: centerGroup, lockRotation: lockRotation, pulseTint: pulseTint };
+  }
+  function rebuildGroupCenters() {
+    var acc = {};
+    if (!LEVEL || !LEVEL.objs) { groupCenterCache = {}; return; }
+    LEVEL.objs.forEach(function (o) {
+      if (!o.groups || !o.groups.length || LevelModel.kindOf(o.id) === 'trigger' || LevelModel.kindOf(o.id) === 'fx') return;
+      var fp = LevelModel.footprint(o), cx = o.gx * CELL + fp.w * CELL / 2, cy = o.gy * CELL + fp.h * CELL / 2;
+      o.groups.forEach(function (gid) {
+        if (!acc[gid]) acc[gid] = { x: 0, y: 0, n: 0 };
+        acc[gid].x += cx; acc[gid].y += cy; acc[gid].n++;
+      });
+    });
+    groupCenterCache = {};
+    Object.keys(acc).forEach(function (gid) { groupCenterCache[gid] = { x: acc[gid].x / acc[gid].n, y: acc[gid].y / acc[gid].n }; });
+  }
+  function easingSample(type, rate, x) {
+    if (x === 0 || x === 1) return x;
+    if (rate === undefined || rate === null) rate = 2;
+    function bounceTime(v) {
+      if (v < 1 / 2.75) return 7.5625 * v * v;
+      if (v < 2 / 2.75) { v -= 1.5 / 2.75; return 7.5625 * v * v + 0.75; }
+      if (v < 2.5 / 2.75) { v -= 2.25 / 2.75; return 7.5625 * v * v + 0.9375; }
+      v -= 2.625 / 2.75; return 7.5625 * v * v + 0.984375;
+    }
+    var t, period, shift;
+    switch (type) {
+      case 0: return x;
+      case 1: t = x * 2; return t < 1 ? 0.5 * Math.pow(t, rate) : 1 - 0.5 * Math.pow(2 - t, rate);
+      case 2: return Math.pow(x, rate);
+      case 3: return Math.pow(x, 1 / rate);
+      case 4:
+        period = rate || 0.45; shift = period / 4; t = x - 1;
+        return t < 0 ? -0.5 * Math.pow(2, 10 * t) * Math.sin((t - shift) * 2 * Math.PI / period) : Math.pow(2, -10 * t) * Math.sin((t - shift) * 2 * Math.PI / period) * 0.5 + 1;
+      case 5: period = rate; shift = period / 4; t = x - 1; return -Math.pow(2, 10 * t) * Math.sin((t - shift) * 2 * Math.PI / period);
+      case 6: period = rate; shift = period / 4; return Math.pow(2, -10 * x) * Math.sin((x - shift) * 2 * Math.PI / period) + 1;
+      case 7: return x < 0.5 ? (1 - bounceTime(1 - x * 2)) * 0.5 : bounceTime(x * 2 - 1) * 0.5 + 0.5;
+      case 8: return 1 - bounceTime(1 - x);
+      case 9: return bounceTime(x);
+      case 10: return x < 0.5 ? 0.5 * Math.pow(2, 10 * (x * 2 - 1)) : 0.5 * (-Math.pow(2, -10 * (x * 2 - 1)) + 2);
+      case 11: return Math.max(0, Math.pow(2, 10 * (x - 1)) - 0.001);
+      case 12: return -Math.pow(2, -10 * x) + 1;
+      case 13: return -0.5 * (Math.cos(x * Math.PI) - 1);
+      case 14: return 1 - Math.cos(x * Math.PI / 2);
+      case 15: return Math.sin(x * Math.PI / 2);
+      case 16:
+        var overshoot = 1.70158 * 1.525; t = x * 2;
+        return t < 1 ? (t * t * ((overshoot + 1) * t - overshoot)) / 2 : ((t - 2) * (t - 2) * ((overshoot + 1) * (t - 2) + overshoot)) / 2 + 1;
+      case 17: return x * x * ((1.70158 + 1) * x - 1.70158);
+      case 18: t = x - 1; return t * t * ((1.70158 + 1) * t + 1.70158) + 1;
+      default: return x;
+    }
+  }
+
+  function pulseIntensity(t, fadeIn, hold, fadeOut) {
+    var v;
+    if (t < fadeIn) v = fadeIn > 0 ? t / fadeIn : 1;
+    else if (t < fadeIn + hold) v = 1;
+    else if (t < fadeIn + hold + fadeOut) v = fadeOut > 0 ? 1 - (t - fadeIn - hold) / fadeOut : 0;
+    else v = 0;
+    return Math.round(v * 32) / 32;
   }
   function tickTweens() {
     Object.keys(groupState).forEach(function (g) {
       var s = groupState[g], j, tw, f;
-      if (s.tweens.length || s.atw) dynDirty = true;
+      if (s.tweens.length || s.atw || s.rotTweens.length) dynDirty = true;
       for (j = s.tweens.length - 1; j >= 0; j--) {
         tw = s.tweens[j]; tw.t++;
         if (tw.t >= tw.dur) { s.bx += tw.dx; s.by += tw.dy; s.tweens.splice(j, 1); }
@@ -303,35 +445,79 @@
       if (s.atw) {
         s.atw.t++;
         f = Math.min(1, s.atw.t / s.atw.dur);
+        f = easingSample(s.atw.easingType, s.atw.easingRate, f);
         s.alpha = s.atw.from + (s.atw.to - s.atw.from) * f;
         if (f >= 1) s.atw = null;
       }
+      for (j = s.rotTweens.length - 1; j >= 0; j--) {
+        tw = s.rotTweens[j]; tw.t++;
+        var rp = Math.min(1, tw.t / tw.dur);
+        var rs = easingSample(tw.easingType, tw.easingRate, rp);
+        var ps = easingSample(tw.easingType, tw.easingRate, tw.prev);
+        s.rotation += (rs - ps) * tw.totalRad;
+        tw.prev = rp;
+        if (rp >= 1) s.rotTweens.splice(j, 1);
+      }
+      for (j = s.pulses.length - 1; j >= 0; j--) {
+        var pulse = s.pulses[j]; pulse.t++;
+        var sec = pulse.t / 60;
+        var intensity = pulseIntensity(sec, pulse.fadeIn, pulse.hold, pulse.fadeOut);
+        pulse.tint = intensity > 0.01 ? rgbStr({ r: pulse.r * intensity, g: pulse.g * intensity, b: pulse.b * intensity }) : null;
+        if (sec >= pulse.total) s.pulses.splice(j, 1);
+      }
     });
+    for (var cp = channelPulses.length - 1; cp >= 0; cp--) {
+      var chp = channelPulses[cp]; chp.t++;
+      var cs = chp.t / 60, ci = pulseIntensity(cs, chp.fadeIn, chp.hold, chp.fadeOut);
+      if (ci > 0.01) LEVEL.palette[chp.channel] = rgbStr({ r: chp.base.r + (chp.r - chp.base.r) * ci, g: chp.base.g + (chp.g - chp.base.g) * ci, b: chp.base.b + (chp.b - chp.base.b) * ci });
+      else LEVEL.palette[chp.channel] = rgbStr(chp.base);
+      if (cs >= chp.total) { LEVEL.palette[chp.channel] = rgbStr(chp.base); channelPulses.splice(cp, 1); }
+    }
   }
   function stopGroup(g) {
     var s = groupState[g];
     if (!s) return;
     dynDirty = true;
-    s.tweens.forEach(function (tw) { var f = Math.min(1, tw.t / tw.dur); s.bx += tw.dx * f; s.by += tw.dy * f; });
+    s.tweens.forEach(function (tw) { var f = easingSample(tw.easingType, tw.easingRate, Math.min(1, tw.t / tw.dur)); s.bx += tw.dx * f; s.by += tw.dy * f; });
     s.tweens = [];
+    s.rotTweens = [];
+    s.pulses = [];
     s.atw = null;
   }
   function fireTrigger(t) {
     var p = t.p, g = p.target;
+    if (t.kind === 'pulse') {
+      var fadeIn = Math.max(0, p.fadeIn || 0), hold = Math.max(0, p.hold || 0), fadeOut = Math.max(0, p.fadeOut || 0);
+      var total = fadeIn + hold + fadeOut;
+      if (p.targetType === 1 && p.targetGroup > 0) {
+        var ps = gstate(p.targetGroup);
+        ps.pulses.push({ r: p.r, g: p.g, b: p.b, fadeIn: fadeIn, hold: hold, fadeOut: fadeOut, total: total > 0 ? total : 0.01, t: 0, tint: null });
+      } else if (p.targetType === 0 && p.targetChannel > 0) {
+        channelPulses.push({ channel: p.targetChannel, base: parseRGB(LEVEL.palette[p.targetChannel]), r: p.r, g: p.g, b: p.b, fadeIn: fadeIn, hold: hold, fadeOut: fadeOut, total: total > 0 ? total : 0.01, t: 0 });
+      }
+      return;
+    }
     if (!g) return;
     dynDirty = true;
     if (t.kind === 'stop') { stopGroup(g); return; }
     var s = gstate(g);
     if (t.kind === 'toggle') s.hidden = !p.activate;
-    else if (t.kind === 'alpha') s.atw = { from: s.alpha, to: p.opacity === undefined ? 1 : p.opacity, dur: frames(p.dur), t: 0 };
-    else if (t.kind === 'move') s.tweens.push({ dx: p.dx || 0, dy: p.dy || 0, dur: frames(p.dur), t: 0 });
+    else if (t.kind === 'alpha') s.atw = { from: s.alpha, to: p.opacity === undefined ? 1 : p.opacity, dur: frames(p.dur), t: 0, easingType: p.easingType || 0, easingRate: p.easingRate === undefined ? 2 : p.easingRate };
+    else if (t.kind === 'move') s.tweens.push({ dx: p.dx || 0, dy: p.dy || 0, dur: frames(p.dur), t: 0, easingType: p.easingType || 0, easingRate: p.easingRate === undefined ? 2 : p.easingRate });
+    else if (t.kind === 'rotate') {
+      var totalDeg = (p.degrees || 0) + ((p.times360 || 0) * 360);
+      s.centerGroup = p.centerGroup || 0;
+      s.lockRotation = !!p.lockRotation;
+      s.rotTweens.push({ totalRad: totalDeg * Math.PI / 180, dur: frames(p.dur), t: 0, prev: 0, easingType: p.easingType || 0, easingRate: p.easingRate === undefined ? 2 : p.easingRate });
+    }
   }
   // Reference rules: a non-touch trigger fires when the player passes it; a spawn trigger (touch or position)
   // queues its target group after its delay; the group's triggers then fire. Triggers in a spawn-targeted
   // group only fire through their group. Triggers never fire at level start by themselves.
   var targetsCache = {};
   function startTriggers() {
-    groupState = {}; trigFired = {}; groupQueue = []; frameNo = 0; dynDirty = true;
+    groupState = {}; trigFired = {}; groupQueue = []; frameNo = 0; dynDirty = true; channelPulses = [];
+    rebuildGroupCenters();
     targetsCache = spawnTargets();
     startColourTriggers();
   }
@@ -385,26 +571,51 @@
   function startColourTriggers() {
     colTrigFired = [];
     colourTweens = [];
+    CHANNEL_ALPHA = {};
+    CHANNEL_BLEND = {};
+    LIGHT_BG_CACHE.key = null;
     var list = LEVEL.sim().colourTriggers || [];
     for (var i = 0; i < list.length; i++) colTrigFired[i] = false;
   }
   function applyColourNow(t) {
-    var op = t.p.op === undefined ? 1 : t.p.op;
-    var c = { r: t.p.r * op, g: t.p.g * op, b: t.p.b * op };
+    var ch = t.p.channel;
+    // reference triggerColor: the target is the copy-source channel (with its HSV adjustment)
+    // when a copy channel is set; the opacity tweens separately and applies as sprite alpha
+    var target = { r: t.p.r, g: t.p.g, b: t.p.b };
+    var copy = t.p.copy > 0 && t.p.copy !== ch ? t.p.copy : 0;
+    if (copy) {
+      var srcCol = copy === 1000 ? bgColor() : copy === 1001 ? groundColor() : channelColor(copy);
+      var srcRgb = rgbParts(srcCol) || { r: 255, g: 255, b: 255 };
+      target = applyChannelHsv(srcRgb, t.p.hsv || null);
+    }
+    if (t.p.blending) CHANNEL_BLEND[ch] = true;      // reference setChannelBlending (sticky)
     // a new trigger on a channel supersedes (and stops) any tween still running there
-    for (var i = colourTweens.length - 1; i >= 0; i--) if (colourTweens[i].ch === t.p.channel) colourTweens.splice(i, 1);
+    for (var i = colourTweens.length - 1; i >= 0; i--) if (colourTweens[i].ch === ch) colourTweens.splice(i, 1);
+    var opFrom = channelAlphaOf(ch), opTo = t.p.op === undefined ? 1 : Math.max(0, Math.min(1, t.p.op));
     if (!t.p.dur || t.p.dur <= 1 / 60) {
-      LEVEL.palette[t.p.channel] = rgbStr(c);
+      LEVEL.palette[ch] = rgbStr(target);
+      CHANNEL_ALPHA[ch] = opTo;
       return;
     }
-    colourTweens.push({ ch: t.p.channel, from: parseRGB(LEVEL.palette[t.p.channel]), to: c, t: 0, dur: frames(t.p.dur) });
+    colourTweens.push({
+      ch: ch, from: parseRGB(LEVEL.palette[ch] || channelColor(ch) || 'rgb(255,255,255)'), to: target,
+      t: 0, dur: frames(t.p.dur), copy: copy, hsv: t.p.hsv || null,
+      opFrom: opFrom, opTo: opTo
+    });
   }
   function tickColourTweens() {
     for (var i = colourTweens.length - 1; i >= 0; i--) {
       var tw = colourTweens[i];
       tw.t++;
       var f = Math.min(1, tw.t / tw.dur);
+      // reference ColorManager.step: a copy tween re-resolves its target while it runs
+      if (tw.copy) {
+        var srcCol = tw.copy === 1000 ? bgColor() : tw.copy === 1001 ? groundColor() : channelColor(tw.copy);
+        var srcRgb = rgbParts(srcCol);
+        if (srcRgb) tw.to = applyChannelHsv(srcRgb, tw.hsv || null);
+      }
       LEVEL.palette[tw.ch] = rgbStr({ r: tw.from.r + (tw.to.r - tw.from.r) * f, g: tw.from.g + (tw.to.g - tw.from.g) * f, b: tw.from.b + (tw.to.b - tw.from.b) * f });
+      CHANNEL_ALPHA[tw.ch] = tw.opFrom + (tw.opTo - tw.opFrom) * f;
       if (f >= 1) colourTweens.splice(i, 1);
     }
   }
@@ -449,6 +660,10 @@
       }
     }
     var lv = LEVEL.sim(), end = endX();
+    // Preserve the full-frame displacement for the UFO's reference tilt calculation;
+    // GameSim itself runs four substeps and its lastY is updated per substep.
+    p.frameStartY = p.y;
+    if (p2) p2.frameStartY = p2.y;
     for (var i = 0; i < 4; i++) {
       var pressed = pressQueued && i === 0;
       var hold = holding;
@@ -457,8 +672,11 @@
       if (p.dead || (p2 && p2.dead)) { status = 'dead'; demoActive = false; break; }
       if (p.x >= end) { status = 'won'; demoActive = false; break; }
     }
+    p.frameDeltaY = p.y - p.frameStartY;
+    if (p2) p2.frameDeltaY = p2.y - p2.frameStartY;
     pressQueued = false;
     updatePlayCamera(false);
+    stepVisualAnims(FRAME_MS / 1000);
     dirty = true;
   }
 
@@ -500,14 +718,108 @@
 
   // colour of a block or decoration from its GD colour channel (null: keep the plain black and white look)
   var MONO = false;                 // true: plain black and white (e-ink friendly), ignores channel colours
-  function chanColor(o) {
+  // ---- special channels (reference ColorManager._getBaseColor / lightBgColor) ----
+  // 1005 = player primary, 1006 = player secondary, 1007 = lightened background mixed toward
+  // the player colour when the bg is dark, 1009 = ground copy, 1010 = black, 1011 = white.
+  // Channels 1005-1007 (and any channel with blending on) render additive in the reference.
+  var CHANNEL_BLEND = {};           // colour-trigger "blending" flag per channel (sticky)
+  var CHANNEL_ALPHA = {};           // colour-trigger channel opacity (applied as sprite alpha)
+  function rgbParts(str) {
+    var m = /^rgb\((\d+),(\d+),(\d+)\)$/.exec(str || '');
+    return m ? { r: +m[1], g: +m[2], b: +m[3] } : null;
+  }
+  function rgbToHsvPort(c) {
+    var max = Math.max(c.r, c.g, c.b), min = Math.min(c.r, c.g, c.b), diff = max - min, h = 0;
+    if (diff !== 0) {
+      if (max === c.r) h = 60 * (((c.g - c.b) / diff) % 6);
+      else if (max === c.g) h = 60 * ((c.b - c.r) / diff + 2);
+      else h = 60 * ((c.r - c.g) / diff + 4);
+      if (h < 0) h += 360;
+    }
+    return { h: h, s: max === 0 ? 0 : (diff / max) * 100, v: (max / 255) * 100 };
+  }
+  function hsvToRgbPort(h, s, v) {
+    var sat = Math.max(0, Math.min(100, s)) / 100, val = Math.max(0, Math.min(100, v)) / 100;
+    var c = val * sat, x = c * (1 - Math.abs(((h / 60) % 2) - 1)), m = val - c, r = 0, g = 0, b = 0;
+    if (h < 60) { r = c; g = x; } else if (h < 120) { r = x; g = c; } else if (h < 180) { g = c; b = x; }
+    else if (h < 240) { g = x; b = c; } else if (h < 300) { r = x; b = c; } else { r = c; b = x; }
+    return { r: Math.trunc((r + m) * 255), g: Math.trunc((g + m) * 255), b: Math.trunc((b + m) * 255) };
+  }
+  // reference applyChannelHsv: copy-channel HSV adjustments
+  function applyChannelHsv(c, hsv) {
+    if (!hsv) return c;
+    var base = rgbToHsvPort(c);
+    var h = (base.h + hsv.h) % 360; if (h < 0) h += 360;
+    var s = hsv.sAdd ? base.s / 100 + hsv.s : (base.s / 100) * hsv.s;
+    var v = hsv.vAdd ? base.v / 100 + hsv.v : (base.v / 100) * hsv.v;
+    return hsvToRgbPort(h, s * 100, v * 100);
+  }
+  // reference lightBgColor: lighten the bg colour; when the bg is very dark, mix toward the
+  // player colour proportionally to how far below 150 the channel sum is
+  var LIGHT_BG_CACHE = { key: null, val: null };
+  function lightBgColor() {
+    var bgStr = bgColor(), key = bgStr;
+    if (LIGHT_BG_CACHE.key === key) return LIGHT_BG_CACHE.val;
+    var bg = rgbParts(bgStr) || { r: 255, g: 255, b: 255 };
+    var p1 = rgbParts(ICON_MAIN) || { r: 255, g: 255, b: 255 };
+    var max = Math.max(bg.r, bg.g, bg.b) / 255, min = Math.min(bg.r, bg.g, bg.b) / 255;
+    var base = rgbToHsvPort(bg);
+    var sat = Math.max(0.0001, Math.min(1, (max === 0 ? 0 : (max - min) / max) - 0.2));
+    var val = Math.max(0.0001, Math.min(1, max + 0.2));
+    var c = val * sat, h = base.h, x = c * (1 - Math.abs(((h / 60) % 2) - 1)), m = val - c, r = 0, g = 0, b = 0;
+    if (h < 60) { r = c; g = x; } else if (h < 120) { r = x; g = c; } else if (h < 180) { g = c; b = x; }
+    else if (h < 240) { g = x; b = c; } else if (h < 300) { r = x; b = c; } else { r = c; b = x; }
+    var target = { r: Math.trunc((r + m) * 255), g: Math.trunc((g + m) * 255), b: Math.trunc((b + m) * 255) };
+    var out;
+    var sum = bg.r + bg.g + bg.b;
+    if (sum >= 150) out = target;
+    else {
+      var f = sum / 150;
+      out = {
+        r: Math.trunc(Math.max(0, Math.min(255, (1 - f) * p1.r + f * target.r))),
+        g: Math.trunc(Math.max(0, Math.min(255, (1 - f) * p1.g + f * target.g))),
+        b: Math.trunc(Math.max(0, Math.min(255, (1 - f) * p1.b + f * target.b)))
+      };
+    }
+    LIGHT_BG_CACHE.key = key; LIGHT_BG_CACHE.val = 'rgb(' + out.r + ',' + out.g + ',' + out.b + ')';
+    return LIGHT_BG_CACHE.val;
+  }
+  // resolve any channel to a css colour, reference ColorManager._getBaseColor order:
+  // explicit palette value first, then the special channels, then white.
+  function channelColor(ch) {
     var pal = LEVEL.palette;
-    if (MONO || !pal) return null;
+    if (MONO || !pal || !ch || ch < 0) return null;
+    if (pal[ch]) return pal[ch];
+    if (ch === 1005) return ICON_MAIN;         // player primary (reference: mainColor)
+    if (ch === 1006) return ICON_SEC;          // player secondary (reference: secondaryColor)
+    if (ch === 1007) return lightBgColor();    // light bg (reference: lightBgColor(bg, p1))
+    if (ch === 1009) return groundColor();     // ground copy
+    if (ch === 1010) return '#000000';         // black channel when unset
+    if (ch === 1011) return '#ffffff';         // white channel when unset
+    if (ch === 1) return ICON_MAIN;            // reference _getBaseColor(1) = mainColor
+    if (ch === 2) return ICON_SEC;             // reference _getBaseColor(2) = secondaryColor
+    return '#ffffff';                          // unset channels default white
+  }
+  function channelAlphaOf(ch) {
+    if (!ch || ch < 0) return 1;
+    var a = CHANNEL_ALPHA[ch];
+    return a === undefined ? 1 : a;
+  }
+  function chanColor(o) {
+    if (MONO || !LEVEL.palette) return null;
     var ch = o.col || defChannel(o.id);
     if (!ch || ch === 1000 || ch === 1001) return null;   // bg / ground come from their own header channels
-    if (pal[ch]) return pal[ch];
-    if (ch === 1) return '#00ffff';          // unset player-1 channel: GD default cyan
-    return '#ffffff';                        // reference ColorManager.getColor: unset channels default white
+    return channelColor(ch);
+  }
+  // reference registerColor: channels 1005-1007, blending-flagged channels and the legacy
+  // 1002 line channel render additive
+  function chanAdditive(o) {
+    var ch = o.col || defChannel(o.id);
+    if (isAdditive(o.id)) return true;
+    if (!ch || !canColor(o.id)) return false;
+    if (ch >= 1005 && ch <= 1007) return true;
+    if (LEVEL.legacyColor && ch === 1002) return true;
+    return !!CHANNEL_BLEND[ch];
   }
   // background and ground come from their own header channels (1000, 1001), never from object channels.
   // Unset channels use the reference ColorManager defaults: bg rgb(0,102,255), ground rgb(0,68,170)
@@ -655,20 +967,34 @@
     return c;
   }
 
-  // ---- sawblade spin (reference level.js: sawObjectIds spin continuously; frames containing
-  // "sawblade" also get a black tint plus a mirrored black twin at rotation + PI) ----
-  function newSet(list) { var s = {}, i; for (i = 0; i < list.length; i++) s[list[i]] = true; return s; }
-  var SAW_IDS = newSet([183, 184, 185, 186, 187, 188, 397, 398, 399, 678, 679, 680, 740, 741, 742, 1619, 1620, 1708, 1709, 1710, 1734, 1735, 1736, 85, 86, 87, 97, 137, 138, 139, 154, 155, 156, 180, 181, 182, 1019, 1020, 1021, 1058, 1059, 1060, 1061, 1752, 396, 395, 222, 223, 224, 997, 998, 999, 1000, 1055, 1056, 1057, 394, 375, 376, 377, 378, 677, 676, 675]);
-  var FAST_SAW_IDS = newSet([186, 187, 188, 89, 88, 98, 183, 185, 184, 397, 398, 399, 678, 679, 680, 740, 741, 742, 1619, 1620, 1705, 1706, 1707, 1708, 1709, 1710, 1734, 1735, 1736]);
-  function sawPhase(o, kind, isFast, isDeco) {
-    var seed = (o.gx * 73 + o.gy * 131 + (o.id || 0) * 7) | 0;
-    var sign = (seed & 1) ? -1 : 1;
-    var base = isDeco ? 0.0034 * 1.15 : (isFast ? 0.0063 : 0.0032);
-    if (kind === 'ring') base = 0.0065;
-    var r2 = (isDeco ? (isFast ? 0.75 : 0.45) : (isFast ? 0.65 : 0.4));
-    var r1 = (Math.abs(seed) % 628) / 100;
-    var tS = ANIM_MS / 1000;
-    return sign * (base * ANIM_MS + r2 * (Math.cos(r1) - Math.cos(tS + r1)));
+  // ---- animated saws (Web Dashers game-scene.js: deltaTime * 0.003) ----
+  // Only sawblade atlas frames and dropRing/gravJumpRing ring sprites are animated.
+  // Blade/cogwheel decorations with similar silhouettes are static in Web Dashers.
+  function sawPhase() { return ANIM_MS * 0.003; }
+
+  // ---- reference saw spin (level.js sawObjectIds / fastSawObjectIds + game-scene update) ----
+  // Saw ids spin continuously; each instance gets a random direction and ±10% speed
+  // (base 0.0032 rad/ms, fast 0.0063, decorative sawblade frames ×1.15) plus a sinusoidal
+  // wobble (±0.0004/0.00065) around it. Values are hashed per instance so they stay stable.
+  var SAW_OBJ_IDS = { 183: 1, 184: 1, 185: 1, 186: 1, 187: 1, 188: 1, 397: 1, 398: 1, 399: 1, 678: 1, 679: 1, 680: 1, 740: 1, 741: 1, 742: 1, 1619: 1, 1620: 1, 1708: 1, 1709: 1, 1710: 1, 1734: 1, 1735: 1, 1736: 1, 85: 1, 86: 1, 87: 1, 97: 1, 137: 1, 138: 1, 139: 1, 154: 1, 155: 1, 156: 1, 180: 1, 181: 1, 182: 1, 1019: 1, 1020: 1, 1021: 1, 1058: 1, 1059: 1, 1060: 1, 1061: 1, 1752: 1, 396: 1, 395: 1, 222: 1, 223: 1, 224: 1, 997: 1, 998: 1, 999: 1, 1000: 1, 1055: 1, 1056: 1, 1057: 1, 394: 1, 375: 1, 376: 1, 377: 1, 378: 1, 677: 1, 676: 1, 675: 1 };
+  var SAW_FAST_IDS = { 186: 1, 187: 1, 188: 1, 89: 1, 88: 1, 98: 1, 183: 1, 185: 1, 184: 1, 397: 1, 398: 1, 399: 1, 678: 1, 679: 1, 680: 1, 740: 1, 741: 1, 742: 1, 1619: 1, 1620: 1, 1705: 1, 1706: 1, 1707: 1, 1708: 1, 1709: 1, 1710: 1, 1734: 1, 1735: 1, 1736: 1 };
+  function sawHash(o) {
+    var h = (o.id | 0) * 374761393 + ((o.gx * 30) | 0) * 668265263 + ((o.gy * 30) | 0) * 2246822519;
+    h = (h ^ (h >>> 13)) * 1274126177;
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;    // 0..1
+  }
+  function sawSpinPhase(o, frameName) {
+    var fast = SAW_FAST_IDS[o.id] === 1;
+    var deco = frameName && frameName.indexOf('sawblade') >= 0;
+    var base = (fast ? 0.0063 : 0.0032) * (deco ? 1.15 : 1);
+    var r1 = sawHash(o);                              // speed sign + variation
+    var r2 = sawHash({ id: o.id + 7, gx: o.gy, gy: o.gx });   // wobble phase
+    var speed = (r1 < 0.5 ? -1 : 1) * (base * (0.9 + 0.2 * ((r1 * 7919) % 1)));
+    var wobble = deco ? (fast ? 0.00075 : 0.00045) : (fast ? 0.00065 : 0.0004);
+    var phase = r2 * Math.PI * 2;
+    var t = ANIM_MS;                                  // elapsed ms
+    // rotation(t) = ∫ (speed + wobble·sin(t/1000 + φ)) dt   (reference per-frame update)
+    return speed * t - wobble * 1000 * (Math.cos(t / 1000 + phase) - Math.cos(phase));
   }
 
   // ---- atlas sprites (ZainojdafMod / Web Dashers art). Sheets load once; frames are cut from them ----
@@ -738,78 +1064,289 @@
     WHITE_INK[name] = v;
     return v;
   }
+  function drawAtlasCrop(g, f, src, x, y, sx, sy) {
+    if (src) g.drawImage(src, 0, 0, f[3], f[4], x, y, f[3] * sx, f[4] * sy);
+    else g.drawImage(SHEET_IMGS[f[0]], f[1], f[2], f[3], f[4], x, y, f[3] * sx, f[4] * sy);
+  }
+
+  // A packed atlas frame is often only the trimmed visible portion of a larger sprite.
+  // Web Dashers keeps the original sprite origin at the level object's x/y and applies
+  // the frame's spriteSourceSize offset before rotation. Rotate around that authored
+  // origin, NOT around the trimmed rectangle's centre (Hexagon Force decorations rely on this).
+  function framePlacement(f, kx, ky, unit) {
+    // centre of the trimmed frame relative to the untrimmed source centre (both axes, same convention),
+    // so front and back halves of a portal land on the same oval
+    var sw = f[7] || f[3], sh = f[8] || f[4];
+    var tx = f[5] || 0, ty = f[6] || 0;
+    return {
+      x: (tx + f[3] / 2 - sw / 2) * unit * kx,
+      y: (ty + f[4] / 2 - sh / 2) * unit * ky,
+      w: f[3] * unit * kx,
+      h: f[4] * unit * ky
+    };
+  }
+
   // draws an object from its atlas frame: centred on the object, rotated about that centre (clockwise, as GD),
   // flipped if the level says so, and added to the background for additive objects (Web Dashers' blend)
-  function drawSpriteObj(g, toS, o, x0, y1, alpha) {
+  // child parts of multi-part objects (reference level.js children): each offset is in the object's own space,
+  // so it is drawn inside the object's flip and rotation transform, centred on the child position
+  function objectMeta(id) {
+    return typeof OBJ_META !== 'undefined' && OBJ_META[id] ? OBJ_META[id] : {};
+  }
+  function frameForObject(o) {
+    var meta = objectMeta(o.id);
+    if (meta.animFrames && meta.animFrames.length) {
+      return meta.animFrames[Math.floor(ANIM_MS / (meta.animInterval || 100)) % meta.animFrames.length];
+    }
+    if (meta.randomFrames && meta.randomFrames.length) {
+      var seed = Math.abs(Math.round((o.gx || 0) * 73 + (o.gy || 0) * 131 + o.id * 7));
+      return meta.randomFrames[seed % meta.randomFrames.length];
+    }
+    return frameOf(o.id);
+  }
+
+  var CHILD_ORDER_CACHE = {}, LEGACY_CHILD_CACHE = {};
+  function drawChildParts(g, kids, kx, ky, col, o, front, pulseTint, parentGlowFrame) {
+    // Child definitions are immutable per object ID. Sort them once, not twice per
+    // instance per frame (late levels can contain 10k+ child-bearing instances).
+    var cacheKey = String(o.id), ordered = CHILD_ORDER_CACHE[cacheKey];
+    if (!ordered) {
+      ordered = kids.slice().sort(function (a, b) { return (Number(a[5]) || 0) - (Number(b[5]) || 0); });
+      CHILD_ORDER_CACHE[cacheKey] = ordered;
+    }
+    // Web Dashers children have their own tint, blend mode and z offset. Negative-z
+    // children sit behind the parent; zero/positive-z children sit in front.
+    for (var i = 0; i < ordered.length; i++) {
+      var k = ordered[i], cf = FRAMES[k[0]];
+      if (!cf || cf[9] || !sheetImage(cf[0]) || ((k[5] >= 0) !== !!front)) continue;
+      if (k[6] && window.enablePortalGuide === false) continue;
+      if (k[7] && window.enableOrbGuide === false) continue;
+      var sx = SPRITE_UNIT * kx, sy = SPRITE_UNIT * ky;
+      var cp = framePlacement(cf, kx, ky, SPRITE_UNIT);
+      var cw = cp.w, ch = cp.h;
+      var childName = k[0];
+      var childSaw = childName.indexOf('sawblade') >= 0;
+      var childRing = childName.indexOf('dropRing') >= 0 || childName.indexOf('gravJumpRing') >= 0;
+      var childSpin = (childSaw || childRing) ? sawPhase() : 0;
+      // child colour: channel mode 0 = parent base channel, 1 = object detail channel,
+      // >1 = explicit channel (reference registerColor child resolution); literal child
+      // tints are only a fallback when no channel colour applies
+      // reference childVisualDef/blackDefault: a child whose literal tint is 0 (black) keeps
+      // that black even while the group pulses
+      var childTint = k[3] === 0 ? '#000000' : (pulseTint || null);
+      if (!childTint) {
+        var chMode = k.length > 11 ? k[11] : 0;
+        var childCol = null;
+        if (canColor(o.id)) {
+          if (chMode === 1) childCol = channelColor(o.col2 || objectMeta(o.id).detailChannel || 2);
+          else if (chMode > 1) childCol = channelColor(chMode);
+          else childCol = col;
+        }
+        if (childCol) childTint = childCol;
+        else if (k[3] !== null && k[3] !== undefined) {
+          childTint = typeof k[3] === 'number' ? '#' + ('000000' + (k[3] >>> 0).toString(16)).slice(-6) : String(k[3]);
+        }
+      }
+      if (childSaw) childTint = '#000';
+      var csrc = childTint ? frameTint(k[0], cf, childTint) : null;
+      // TEMP PROBE: record child draws for traced objects
+      if (window.RRDebug && RRDebug._traceIds && RRDebug._traceIds.indexOf(o.id) >= 0 && g.canvas && g.canvas.id === 'game') {
+        (RRDebug.__childProbe = RRDebug.__childProbe || []).push({ id: o.id, fr: k[0], tint: childTint, front: !!front, z: k[5], rot: k[9] || 0, dw: Math.round(cw), dh: Math.round(ch) });
+        if (RRDebug.__childProbe.length > 200) RRDebug.__childProbe.length = 200;
+      }
+      g.save();
+      var objectScale = o.scale !== undefined && isFinite(o.scale) && o.scale > 0 ? o.scale : 1;
+      // reference v2.0 level.js: localDx/localDy are multiplied by the parent's scale BEFORE
+      // the rotation transform, i.e. child offsets scale WITH the object. The canvas transform
+      // here already carries the parent scale, so translate in unscaled local units.
+      g.translate(k[1] * kx, k[2] * ky);
+      if (k[4]) g.globalCompositeOperation = 'lighter';
+      if (k[8]) { g.globalAlpha *= 0.9; g.scale(0.1 / objectScale, 0.1 / objectScale); }
+      // reference Phaser Image: the trimmed-frame offset lives in the sprite's LOCAL space,
+      // so it rotates with the child's own rotation (setAngle applies around the anchor,
+      // then the cutout sits at spriteSourceSize within the sourceSize box). Rotating the
+      // child BEFORE translating by the placement offset reproduces that order; the old
+      // translate-then-rotate left every rotated child stuck at the unrotated offset,
+      // collapsing 4-blade saws into one corner of their box (HF gear corruption).
+      if (childSpin) g.rotate(childSpin);
+      if (k.length > 9 && k[9]) g.rotate(k[9] * Math.PI / 180);   // reference childDef.rot
+      g.translate(cp.x, cp.y);
+      // reference child glow: children whose def (or whose parent's def) carries glow get
+      // an additive glow sprite behind them at 0.425 alpha, tinted like the child
+      var glowName = k.length > 10 ? k[10] : null;
+      if (!glowName && parentGlowFrame && /\.png$/.test(childName)) {
+        var derived = childName.replace('_001.png', '_glow_001.png');
+        if (derived !== childName && FRAMES[derived]) glowName = derived;
+      }
+      if (glowName && FRAMES[glowName] && !FRAMES[glowName][9] && sheetImage(FRAMES[glowName][0])) {
+        var cgf = FRAMES[glowName];
+        var cgp = framePlacement(cgf, kx, ky, SPRITE_UNIT);
+        // reference _addGlowSprite: the child glow uses the child def's literal tint when it
+        // carries one (e.g. the green blade child glows), otherwise the resolved child colour
+        var glowTint = childTint;
+        if (k[3] !== null && k[3] !== undefined) {
+          glowTint = typeof k[3] === 'number' ? '#' + ('000000' + (k[3] >>> 0).toString(16)).slice(-6) : String(k[3]);
+        }
+        var cgsrc = glowTint ? frameTint(glowName, cgf, glowTint) : null;
+        var cga = g.globalAlpha, cgco = g.globalCompositeOperation;
+        g.globalAlpha = cga * 0.425;
+        g.globalCompositeOperation = 'lighter';
+        if (cgsrc) g.drawImage(cgsrc, 0, 0, cgf[3], cgf[4], -cgp.w / 2, -cgp.h / 2, cgp.w, cgp.h);
+        else g.drawImage(SHEET_IMGS[cgf[0]], cgf[1], cgf[2], cgf[3], cgf[4], -cgp.w / 2, -cgp.h / 2, cgp.w, cgp.h);
+        g.globalAlpha = cga;
+        g.globalCompositeOperation = cgco;
+      }
+      drawAtlasCrop(g, cf, csrc, -cw / 2, -ch / 2, sx, sy);
+      if (childSaw) {
+        g.rotate(Math.PI);
+        drawAtlasCrop(g, cf, csrc, -cw / 2, -ch / 2, sx, sy);
+      }
+      g.restore();
+    }
+  }
+
+  function drawSpriteObj(g, toS, o, x0, y1, alpha, rotationExtra, pulseTint) {
     if (MONO) return false;
     var kind = LevelModel.kindOf(o.id);
-    var name = frameOf(o.id);
+    var name = frameForObject(o);
+    var kidList = typeof OBJ_CHILDREN !== 'undefined' ? OBJ_CHILDREN[o.id] : null;
+    // reference v2.0: objects whose main frame is "none"/"emptyFrame" (or whose frame is not
+    // in the atlas, e.g. the "noen" typo) render through their children only — no fallback box
+    if ((!name || !FRAMES[name]) && kidList && kidList.length) {
+      var fp0 = LevelModel.footprint(o);
+      var ccx = x0 + fp0.w * CELL / 2, ccy = y1 - fp0.h * CELL / 2;
+      var C0 = toS(ccx, ccy), O0 = toS(ccx + 1, ccy + 1);
+      var kx0 = Math.abs(O0.x - C0.x), ky0 = Math.abs(O0.y - C0.y);
+      var col0 = pulseTint || chanColor(o);
+      var ga0 = g.globalAlpha, gco0 = g.globalCompositeOperation;
+      // reference _mirrorTransformObjects: objects fade out toward the screen edges mid-flip
+      var mirP0 = mirrorProgress();
+      if (mirP0 > 0 && mirP0 < 1) {
+        var fade0 = Math.min(1, Math.min(C0.x, CW - C0.x) / 140);
+        if (fade0 <= 0) return true;
+        if (fade0 < 1) alpha = (alpha || 1) * fade0;
+      }
+      var mFlip0 = mirP0 >= 0.5 ? -1 : 1;
+      g.save();
+      g.globalAlpha = ga0 * (alpha || 1);
+      if (chanAdditive(o)) g.globalCompositeOperation = 'lighter';
+      g.translate(C0.x, C0.y);
+      if (o.rot || rotationExtra) g.rotate(mFlip0 * ((o.rot || 0) * Math.PI / 180 + (rotationExtra || 0)));
+      if ((o.flipX ? -1 : 1) * mFlip0 < 0) g.scale(-1, 1);
+      if (o.flipY) g.scale(1, -1);
+      if (o.scale !== undefined && isFinite(o.scale) && o.scale > 0 && o.scale !== 1) g.scale(o.scale, o.scale);
+      drawChildParts(g, kidList, kx0, ky0, col0, o, false, pulseTint, false);
+      drawChildParts(g, kidList, kx0, ky0, col0, o, true, pulseTint, false);
+      g.restore();
+      g.globalAlpha = ga0; g.globalCompositeOperation = gco0;
+      return true;
+    }
     if (!name || !FRAMES[name]) return false;
     var f = FRAMES[name];
     if (f[9] || !sheetImage(f[0])) return false;     // rotated atlas frames and unloaded sheets use the fallback
     var u = SPRITE_UNIT;
     var fp = LevelModel.footprint(o);
     var cx = x0 + fp.w * CELL / 2, cy = y1 - fp.h * CELL / 2;      // object centre, world units
-    // reference _applyVisualProps: the sprite offset (realWidth/2 - sourceX - frameWidth/2, ...)
-    // exactly cancels the atlas trim, so the trimmed CONTENT is centred on the object centre and
-    // rotates about it. Draw every frame (and its back half / children / glow) centred on C.
+    // The level object's x/y is the authored sprite origin. Preserve the trimmed
+    // atlas frame's source-size offset in that local coordinate space before rotation.
     var C = toS(cx, cy), O = toS(cx + 1, cy + 1), Z = toS(cx, cy);
     var kx = Math.abs(O.x - Z.x), ky = Math.abs(O.y - Z.y);          // screen px per world unit
-    var dw = f[3] * u * kx, dh = f[4] * u * ky;
-    var col = chanColor(o);
+    // reference _mirrorTransformObjects: fade toward the screen edges while the flip animates
+    var mirP = mirrorProgress();
+    if (mirP > 0 && mirP < 1) {
+      var fade = Math.min(1, Math.min(C.x, CW - C.x) / 140);
+      if (fade <= 0) return true;
+      if (fade < 1) alpha = (alpha || 1) * fade;
+    }
+    var place = framePlacement(f, kx, ky, u);
+    var dw = place.w, dh = place.h;
+    var col = pulseTint || chanColor(o);
     var kids = typeof blackChildren === 'function' ? blackChildren(o.id) : null;
     var black = typeof isBlackObj === 'function' && isBlackObj(o.id);
     // sawblade handling (reference level.js): frames containing "sawblade" tint black and
-    // gain a mirrored twin at rotation + PI; saw ids and ring frames spin continuously
+    // gain a mirrored twin at rotation + PI. Continuous spin is driven by the reference
+    // sawObjectIds set (blades, cogwheels, spikewheels, rotating balls, ...) plus the
+    // sawblade-named decorative frames and dropRing/gravJumpRing orbs.
     var isSawFrame = name.indexOf('sawblade') >= 0;
-    var isSawObj = SAW_IDS[o.id];
-    var isFast = FAST_SAW_IDS[o.id];
-    var isRing = name.indexOf('dropRing') >= 0 || name.indexOf('gravJumpRing') >= 0;
-    var spin = (isSawFrame || isSawObj || isRing) ? sawPhase(o, isRing ? 'ring' : 'saw', isFast, isSawFrame && kind === 'deco') : 0;
+    var isRing = kind === 'orb' && (name.indexOf('dropRing') >= 0 || name.indexOf('gravJumpRing') >= 0);
+    var isSawObj = SAW_OBJ_IDS[o.id] === 1;
+    var spin = (isSawObj || isSawFrame || isRing) ? sawSpinPhase(o, name) : 0;
+    var meta = objectMeta(o.id);
+    var overlayName = (kind === 'solid' || kind === 'hazard') ? name.replace('_001.png', '_2_001.png') : '';
+    var overlayFrame = overlayName && overlayName !== name ? FRAMES[overlayName] : null;
+    var overlayChannel = o.col2 || meta.detailChannel || 2;
+    if (overlayChannel <= 0) overlayChannel = 2;
+    var overlayColor = pulseTint || (canColor(o.id) ? channelColor(overlayChannel) : null);
+    if (black && !canColor(o.id)) { overlayColor = null; }
     var src = null, tintCol = null, glowOff = false;
-    if (isSawFrame) { src = frameTint(name, f, '#000'); glowOff = true; }
+    // reference _applyChannelTint: a black-default object that cannot be coloured stays BLACK no
+    // matter what (the pulse tint must not repaint it either). Colourable black objects stay
+    // black until their channel actually carries a colour.
+    if (black && (!canColor(o.id) || !o.col)) { src = frameTint(name, f, '#000'); glowOff = true; }
+    else if (pulseTint) { src = frameTint(name, f, pulseTint); tintCol = pulseTint; }
+    else if (isSawFrame) { src = frameTint(name, f, '#000'); glowOff = true; }
     else if (black) { src = frameTint(name, f, '#000'); glowOff = true; }
     else if (col && canColor(o.id) && !(col === '#ffffff' && kids)) { src = frameTint(name, f, col); tintCol = col; }
     else if (typeof defTint === 'function' && defTint(o.id) && canColor(o.id)) { src = frameTint(name, f, defTint(o.id)); tintCol = defTint(o.id); }
     // NOTE: white sheet sprites stay white — the real textured background shows them exactly
     // like the reference (the old "paint white ink black" hack made additive wheels/orbs vanish)
-    if (window.CubeDashDebug && CubeDashDebug._traceIds && CubeDashDebug._traceIds.indexOf(o.id) >= 0) {
-      (CubeDashDebug._trace = CubeDashDebug._trace || []).push({
-        id: o.id, kind: kind, name: name, path: src === null ? 'raw' : (src === undefined ? '?' : 'tinted'),
-        col: col, canColor: canColor(o.id), additive: isAdditive(o.id), alpha: alpha,
+    if (window.RRDebug && RRDebug._traceIds && RRDebug._traceIds.indexOf(o.id) >= 0) {
+      (RRDebug._trace = RRDebug._trace || []).push({
+        id: o.id, kind: kind, name: name, path: src === null ? 'raw' : (src === undefined ? '?' : 'tinted'), tgt: (g.canvas && g.canvas.id) || '?',
+        col: col, tintCol: tintCol || null, black: !!black, glowOff: glowOff, pulse: pulseTint || null, canColor: canColor(o.id), additive: isAdditive(o.id), alpha: alpha,
         whiteInk: (kind === 'spike' || kind === 'hazard' || kind === 'decor') ? isWhiteInk(name, f) : null,
-        dw: Math.round(dw), dh: Math.round(dh), cx: Math.round(cx), cy: Math.round(cy)
+        rot: o.rot || 0, scale: o.scale || 1, flipX: !!o.flipX, flipY: !!o.flipY, gx: o.gx, gy: o.gy, Cx: Math.round(C.x), Cy: Math.round(C.y),
+        srcPx: (function () { try { var d = src.getContext('2d').getImageData(Math.floor(f[3] / 2), Math.floor(f[4] / 2), 1, 1).data; return d.join(','); } catch (e) { return 'err'; } })(),
+        overlay: overlayName, hasOverlay: !!overlayFrame,
+        dw: Math.round(dw), dh: Math.round(dh), ox: Math.round(place.x), oy: Math.round(place.y), cx: Math.round(cx), cy: Math.round(cy)
       });
-      if (CubeDashDebug._trace.length > 400) CubeDashDebug._trace.splice(0, 200);
+      if (RRDebug._trace.length > 400) RRDebug._trace.splice(0, 200);
     }
     var ga = g.globalAlpha, gco = g.globalCompositeOperation;
     g.save();
     g.globalAlpha = ga * (alpha || 1);
-    if (isAdditive(o.id)) g.globalCompositeOperation = 'lighter';
+    // reference _updateInvisibleBlockOpacity: invis_/invisibleOutline_ frames fade OUT as the
+    // player approaches (alpha = distance / (screenWidth / 2.5), clamped); the editor shows them
+    if ((name.lastIndexOf('invis', 0) === 0 || name.lastIndexOf('invisibleOutline', 0) === 0) && g.canvas && g.canvas.id === 'game') {
+      var fadeD = CW / 2.5;
+      var dPx = Math.abs(2 * (cx - p.x));
+      g.globalAlpha *= Math.max(0, Math.min(1, dPx / fadeD));
+    }
+    if (chanAdditive(o)) g.globalCompositeOperation = 'lighter';
     g.translate(C.x, C.y);
-    if (o.rot || spin) g.rotate((o.rot || 0) * Math.PI / 180 + spin);
-    if (o.flipX) g.scale(-1, 1);
+    // reference _mirrorTransformObjects: past halfway the sprite mirrors (scaleX negates, rotation negates)
+    var mirFlip = mirP >= 0.5 ? -1 : 1;
+    if (o.rot || spin || rotationExtra) g.rotate(mirFlip * ((o.rot || 0) * Math.PI / 180 + spin + (rotationExtra || 0)));
+    if ((o.flipX ? -1 : 1) * mirFlip < 0) g.scale(-1, 1);
     if (o.flipY) g.scale(1, -1);
-    var dx = -dw / 2, dy = -dh / 2;
+    if (o.scale !== undefined && isFinite(o.scale) && o.scale > 0 && o.scale !== 1) g.scale(o.scale, o.scale);
+    var isRingType = typeof defType === 'function' && defType(o.id) === 'r';
+    if (isRingType) g.scale(0.75, 0.75); // Web Dashers applies setScale(0.75) to every ring
+    var dx = place.x - dw / 2, dy = place.y - dh / 2;
     // portals draw their back half first (Web Dashers: front frame + _back_ frame make the full oval)
     if (kind === 'portal' && name.indexOf('_front_') > 0) {
       var bname = name.replace('_front_', '_back_'), bf = FRAMES[bname];
       if (bf && !bf[9] && sheetImage(bf[0])) {
-        var bdw = bf[3] * u * kx, bdh = bf[4] * u * ky;
-        var bdx = -bdw / 2, bdy = -bdh / 2;
+        var bp = framePlacement(bf, kx, ky, u);
+        var bdw = bp.w, bdh = bp.h;
+        var bdx = bp.x - bdw / 2, bdy = bp.y - bdh / 2;
         var bsrc = col && canColor(o.id) ? frameTint(bname, bf, col) : null;
         if (bsrc) g.drawImage(bsrc, 0, 0, bf[3], bf[4], bdx, bdy, bdw, bdh);
         else g.drawImage(SHEET_IMGS[bf[0]], bf[1], bf[2], bf[3], bf[4], bdx, bdy, bdw, bdh);
       }
     }
+    // child parts: drawn over the parent, in the object's flipped and rotated space
+    var kidList = typeof OBJ_CHILDREN !== 'undefined' ? OBJ_CHILDREN[o.id] : null;
+    if (kidList && !MONO) drawChildParts(g, kidList, kx, ky, col, o, false, pulseTint, !glowOff && typeof GLOW_OF === 'object' && GLOW_OF[o.id]);
     // sawblade mirror twin drawn behind, half a turn ahead of the blade (reference sawMirror)
     // reference _addGlowSprite: objects whose def carries glow get an additive glow sprite
     // behind them at alpha 0.425, tinted like the object (black-default objects skip it)
     if (!glowOff && typeof GLOW_OF === 'object' && GLOW_OF[o.id]) {
       var gname = GLOW_OF[o.id], gf = FRAMES[gname];
       if (gf && !gf[9] && sheetImage(gf[0])) {
-        var gdw = gf[3] * u * kx, gdh = gf[4] * u * ky;
-        var gdx = -gdw / 2, gdy = -gdh / 2;
+        var gp = framePlacement(gf, kx, ky, u);
+        var gdw = gp.w, gdh = gp.h;
+        var gdx = gp.x - gdw / 2, gdy = gp.y - gdh / 2;
         var gsrc = tintCol ? frameTint(gname, gf, tintCol) : null;
         var gga = g.globalAlpha, ggco = g.globalCompositeOperation;
         g.globalAlpha = gga * 0.425;
@@ -820,24 +1357,47 @@
         g.globalCompositeOperation = ggco;
       }
     }
+    if (src) g.drawImage(src, 0, 0, f[3], f[4], dx, dy, dw, dh);
+    else g.drawImage(SHEET_IMGS[f[0]], f[1], f[2], f[3], f[4], dx, dy, dw, dh);
+    if (window.__PITDBG && o.id === 61) { g.save(); g.fillStyle = '#00ff00'; g.fillRect(dx, dy, dw, dh); g.restore(); }
     if (isSawFrame) {
+      // Web Dashers creates a second black sawblade sprite at rotation + PI.
       g.save();
       g.rotate(Math.PI);
       if (src) g.drawImage(src, 0, 0, f[3], f[4], dx, dy, dw, dh);
       else g.drawImage(SHEET_IMGS[f[0]], f[1], f[2], f[3], f[4], dx, dy, dw, dh);
       g.restore();
     }
-    if (src) g.drawImage(src, 0, 0, f[3], f[4], dx, dy, dw, dh);
-    else g.drawImage(SHEET_IMGS[f[0]], f[1], f[2], f[3], f[4], dx, dy, dw, dh);
-    // tint-0 child frames (e.g. the plank's black interior) drawn on top
+    // Web Dashers adds a separate _2 overlay to solid/hazard frames, using detail channel 2 by default.
+    if (overlayFrame && !overlayFrame[9] && sheetImage(overlayFrame[0])) {
+      var op = framePlacement(overlayFrame, kx, ky, u);
+      var odw = op.w, odh = op.h, odx = op.x - odw / 2, ody = op.y - odh / 2;
+      var osrc = overlayColor ? frameTint(overlayName, overlayFrame, overlayColor) : null;
+      if (osrc) g.drawImage(osrc, 0, 0, overlayFrame[3], overlayFrame[4], odx, ody, odw, odh);
+      else g.drawImage(SHEET_IMGS[overlayFrame[0]], overlayFrame[1], overlayFrame[2], overlayFrame[3], overlayFrame[4], odx, ody, odw, odh);
+    }
+    if (kidList && !MONO) drawChildParts(g, kidList, kx, ky, col, o, true, pulseTint, !glowOff && typeof GLOW_OF === 'object' && GLOW_OF[o.id]);
+    // tint-0 child frames are already represented by OBJ_CHILDREN in current Web Dashers data;
+    // retain only any legacy entries that are not present in the child list.
     if (kids) {
-      var kidCol = o.col2 && LEVEL.palette && LEVEL.palette[o.col2] ? LEVEL.palette[o.col2] : '#000';   // detail channel (key 22); default black
-      for (var kk = 0; kk < kids.length; kk++) {
-        var kf = FRAMES[kids[kk]];
+      var kidCol = pulseTint || channelColor(o.col2 || 2) || '#000';   // detail channel (key 22); default black
+      var legacyKey = String(o.id), legacyKids = LEGACY_CHILD_CACHE[legacyKey];
+      if (!legacyKids) {
+        legacyKids = [];
+        for (var lk = 0; lk < kids.length; lk++) {
+          var present = false;
+          if (kidList) for (var li = 0; li < kidList.length; li++) if (kidList[li][0] === kids[lk]) { present = true; break; }
+          if (!present) legacyKids.push(kids[lk]);
+        }
+        LEGACY_CHILD_CACHE[legacyKey] = legacyKids;
+      }
+      for (var kk = 0; kk < legacyKids.length; kk++) {
+        var kf = FRAMES[legacyKids[kk]];
         if (!kf || kf[9] || !sheetImage(kf[0])) continue;
-        var kdw = kf[3] * u * kx, kdh = kf[4] * u * ky;
-        var kdx = -kdw / 2, kdy = -kdh / 2;
-        g.drawImage(frameTint(kids[kk], kf, kidCol), 0, 0, kf[3], kf[4], kdx, kdy, kdw, kdh);
+        var kp = framePlacement(kf, kx, ky, u);
+        var kdw = kp.w, kdh = kp.h;
+        var kdx = kp.x - kdw / 2, kdy = kp.y - kdh / 2;
+        g.drawImage(frameTint(legacyKids[kk], kf, kidCol), 0, 0, kf[3], kf[4], kdx, kdy, kdw, kdh);
       }
     }
     g.restore();
@@ -846,7 +1406,7 @@
   }
 
   // one decoration sprite: the sheet frame placed by its trimmed box (sheet px = 2x level units)
-  function drawDecor(g, toS, o, x0, y0) {
+  function drawDecor(g, toS, o, x0, y0, rotationExtra, pulseTint) {
     var A = DECOR_ATLAS[o.id];
     if (!A || !SHEET_OK[A[0]]) {
       var q1 = toS(x0, y0 + 30), q2 = toS(x0 + 30, y0);
@@ -858,27 +1418,35 @@
     var left = x0 + A[6] / 2, top = y0 + boxH - A[7] / 2;
     var p1 = toS(left, top), p2 = toS(left + A[3] / 2, top - A[4] / 2);
     var dx = p1.x, dy = p1.y, dw = p2.x - p1.x, dh = p2.y - p1.y;
+    var cx = dx + dw / 2, cy = dy + dh / 2;
+    var scale = o.scale !== undefined && isFinite(o.scale) && o.scale > 0 ? o.scale : 1;
+    var tint = pulseTint ? tintedSprite(A, pulseTint) : (canColor(o.id) ? tintedSprite(A, chanColor(o)) : null);
     g.save();
-    if (o.flipX) { g.translate(dx + dw, dy); g.scale(-1, 1); dx = 0; dy = 0; }
-    var tint = canColor(o.id) ? tintedSprite(A, chanColor(o)) : null;
-    if (tint) g.drawImage(tint, 0, 0, A[3], A[4], dx, dy, dw, dh);
-    else g.drawImage(SHEET_IMG[A[0]], A[1], A[2], A[3], A[4], dx, dy, dw, dh);
+    // Transform around the sprite centre. Applying flipX and flipY as independent
+    // translations used to break when both were set, and rotation was ignored here.
+    g.translate(cx, cy);
+    var dMir = mirrorProgress() >= 0.5 ? -1 : 1;
+    if (o.rot || rotationExtra) g.rotate(dMir * ((o.rot || 0) * Math.PI / 180 + (rotationExtra || 0)));
+    g.scale((o.flipX ? -1 : 1) * dMir * scale, (o.flipY ? -1 : 1) * scale);
+    if (tint) g.drawImage(tint, 0, 0, A[3], A[4], -dw / 2, -dh / 2, dw, dh);
+    else g.drawImage(SHEET_IMG[A[0]], A[1], A[2], A[3], A[4], -dw / 2, -dh / 2, dw, dh);
     g.restore();
   }
 
   // GD 2.2 text object (914): the k31 string centred on the object, tinted via its colour channel
-  function drawTextObj(g, toS, o) {
+  function drawTextObj(g, toS, o, rotationExtra, pulseTint) {
     var fp = LevelModel.footprint(o);
     var cx = o.gx * 30 + fp.w * 30 / 2, cy = o.gy * 30 + fp.h * 30 / 2;
     var size = Math.max(6, Math.round(18 * (o.scale || 1)));
     var C = toS(cx, cy);
     var O = toS(cx + 1, cy + 1), Z = toS(cx, cy);
     var k = Math.abs(O.x - Z.x);                    // screen px per world unit
-    var col = chanColor(o) || '#ffffff';
+    var col = pulseTint || chanColor(o) || '#ffffff';
     g.save();
     g.translate(C.x, C.y);
-    if (o.rot) g.rotate(o.rot * Math.PI / 180);
-    if (o.flipX || o.flipY) g.scale(o.flipX ? -1 : 1, o.flipY ? -1 : 1);
+    var tMir = mirrorProgress() >= 0.5 ? -1 : 1;
+    if (o.rot || rotationExtra) g.rotate(tMir * ((o.rot || 0) * Math.PI / 180 + (rotationExtra || 0)));
+    if (o.flipX || o.flipY || tMir < 0) g.scale((o.flipX ? -1 : 1) * tMir, o.flipY ? -1 : 1);
     g.font = 'bold ' + Math.max(6, Math.round(size * k)) + 'px Arial, sans-serif';
     g.textAlign = 'center';
     g.textBaseline = 'middle';
@@ -890,92 +1458,75 @@
     g.restore();
   }
 
+  var PLAY_HIDDEN = { 1755: true };
   function drawWorld(g, toS, s, live) {
     var gz = toS(0, 0);
-    var groundX = toS(0, 0).x;
-    var drewGround = false;
-    if (!MONO && LEVEL.groundId) {
-      var gimg = texImage(groundFileOf(LEVEL));
-      if (TEX_OK[groundFileOf(LEVEL)] && gimg.width) {
-        // reference _buildGround: the tile's top edge sits on the ground line, world-locked (no parallax)
-        drewGround = drawTintedTiled(g, gimg, groundColor(), 0, gz.y, CW, Math.max(0, CH - gz.y), groundX, gz.y);
-        // reference setGround2Color: darker inner pattern, tinted by channel 1009 when the header carries it
-        var g2 = texImage(ground2FileOf(LEVEL));
-        if (LEVEL.palette && LEVEL.palette[1009] && TEX_OK[ground2FileOf(LEVEL)] && g2.width) {
-          drawTintedTiled(g, g2, LEVEL.palette[1009], 0, gz.y, CW, Math.max(0, CH - gz.y), groundX, gz.y);
-        }
-      }
-    }
-    if (!drewGround) { g.fillStyle = groundColor(); g.fillRect(0, gz.y, CW, CH - gz.y); }
-    // reference floorLine sprite: a white edge line on the ground top, additive, fixed to the line
-    if (live && !MONO) {
-      var prevGA = g.globalAlpha, prevGCO = g.globalCompositeOperation;
-      g.globalAlpha = 0.9 * prevGA;
-      g.globalCompositeOperation = 'lighter';
-      g.fillStyle = '#bfbfbf';
-      g.fillRect(0, gz.y - 1, CW, 2);
-      g.globalAlpha = prevGA;
-      g.globalCompositeOperation = prevGCO;
-      // fly corridors show a flipped ground hanging from the top: bottom edge at
-      // b(flyCeilingY) + cameraY (reference updateGroundTiles rightTileIndex)
-      var ceilY = null;
-      if (p && p.flyCeil !== null && p.flyCeil !== undefined && (p.mode === 'ship' || p.mode === 'ufo' || p.mode === 'wave' || p.mode === 'ball' || p.mode === 'spider')) {
-        ceilY = gz.y - 2 * p.flyCeil;
-      }
-      if (ceilY !== null && ceilY > -gimg.height && ceilY < CH) {
-        var fimg = flippedCanvas(gimg) || gimg;
-        var bandY = Math.max(0, ceilY - gimg.height), bandH = Math.min(ceilY, CH) - bandY;
-        var cg = drawTintedTiled(g, fimg, groundColor(), 0, bandY, CW, bandH, groundX, ceilY);
-        if (cg && LEVEL.palette && LEVEL.palette[1009] && TEX_OK[ground2FileOf(LEVEL)] && g2 && g2.width) {
-          var f2 = flippedCanvas(g2) || g2;
-          drawTintedTiled(g, f2, LEVEL.palette[1009], 0, bandY, CW, bandH, groundX, ceilY);
-        }
-        g.globalAlpha = 0.9 * prevGA;
-        g.globalCompositeOperation = 'lighter';
-        g.fillStyle = '#bfbfbf';
-        g.fillRect(0, ceilY - 1, CW, 2);
-        g.globalAlpha = prevGA;
-        g.globalCompositeOperation = prevGCO;
-      }
-    }
-    var objs = live ? visibleObjs(p.x) : LEVEL.objs;
-    var oiStart = live ? VIS_START : 0, oiEnd = live ? VIS_END : objs.length;
-    for (var oi = oiStart; oi < oiEnd; oi++) {
+    // reference updateGroundTiles: the ground pattern is world-locked and only SHIFTED by
+    // 2*mirrorP*cameraDelta during a mirror flip — it is not reflected with the level containers
+    var groundX = live ? (CENTER_X - 2 * p.x + groundShiftPx) : toS(0, 0).x;
+    var objs = live ? visibleObjs(p.x) : allRenderOrder();
+    for (var oi = 0; oi < objs.length; oi++) {
       var o = objs[oi];
       if (o.broken) continue;
       var kind = LevelModel.kindOf(o.id);
       if (kind === 'trigger' || kind === 'fx') continue;
+      if (live && PLAY_HIDDEN[o.id]) continue;      // reference: editor-only dblock sprites are hidden during play
       var inf = live ? (o.groups ? groupInfo(o.groups) : DEFAULT_INF) : null;
       if (inf && inf.hidden) continue;
-      g.globalAlpha = inf ? inf.alpha : 1;
+      // reference _applyChannelAlpha: channel opacity applies as sprite alpha
+      g.globalAlpha = (inf ? inf.alpha : 1) * (live && canColor(o.id) ? channelAlphaOf(o.col || defChannel(o.id)) : 1);
       var fp = LevelModel.footprint(o);
       var x0 = o.gx * CELL + (inf ? inf.dx : 0), y0 = o.gy * CELL + (inf ? inf.dy : 0), x1 = x0 + fp.w * CELL, y1 = y0 + fp.h * CELL;
+      var rotationExtra = inf && (!inf.centerGroup || inf.pivot) && (!inf.centerGroup || !inf.lockRotation) ? inf.rotation : 0;
+      if (inf && inf.rotation && inf.centerGroup > 0 && inf.pivot) {
+        var ocx = x0 + fp.w * CELL / 2, ocy = y0 + fp.h * CELL / 2;
+        var pivotX = inf.pivot.x, pivotY = inf.pivot.y;
+        var pivotState = groupState[inf.centerGroup];
+        if (pivotState) {
+          pivotX += pivotState.bx; pivotY += pivotState.by;
+          for (var pti = 0; pti < pivotState.tweens.length; pti++) {
+            var ptw = pivotState.tweens[pti], ptf = easingSample(ptw.easingType, ptw.easingRate, Math.min(1, ptw.t / ptw.dur));
+            pivotX += ptw.dx * ptf; pivotY += ptw.dy * ptf;
+          }
+        }
+        var odx = ocx - pivotX, ody = ocy - pivotY;
+        var orc = Math.cos(inf.rotation), ors = -Math.sin(inf.rotation); // world y-up; positive GD rotation is clockwise on screen
+        var ncx = pivotX + odx * orc - ody * ors, ncy = pivotY + odx * ors + ody * orc;
+        x0 += ncx - ocx; x1 += ncx - ocx; y0 += ncy - ocy; y1 += ncy - ocy;
+      }
+      var pulseTint = inf ? inf.pulseTint : null;
       // cheap horizontal cull before any allocation (the play view maps x as CENTER_X + 2*(x - p.x))
       if (live) {
         var cx0 = CENTER_X + 2 * (x0 - p.x), cx1 = CENTER_X + 2 * (x1 - p.x);
+        var cmp = mirrorProgress();
+        if (cmp > 0) {
+          // mirror-mapped positions: the reflection can pull far-side objects into view mid-flip
+          cx0 += cmp * (CW - 2 * cx0); cx1 += cmp * (CW - 2 * cx1);
+          if (cx1 < cx0) { var ctmp = cx0; cx0 = cx1; cx1 = ctmp; }
+        }
         if (cx1 < -60 || cx0 > CW + 60) continue;
       }
       var a = toS(x0, y1), b = toS(x1, y0);
       if (b.x < -60 || a.x > CW + 60 || b.y < -60 || a.y > CH + 60) continue;
       var w = b.x - a.x, h = b.y - a.y;
-      if (kind === 'text') { drawTextObj(g, toS, o); g.globalAlpha = 1; continue; }
+      if (kind === 'text') { drawTextObj(g, toS, o, rotationExtra, pulseTint); g.globalAlpha = 1; continue; }
       if (kind === 'decor') {
-        if (!drawSpriteObj(g, toS, o, x0, y1, 1)) drawDecor(g, toS, o, x0, y0);
+        if (!drawSpriteObj(g, toS, o, x0, y1, 1, rotationExtra, pulseTint)) drawDecor(g, toS, o, x0, y0, rotationExtra, pulseTint);
       } else if (kind === 'solid') {
-        if (drawSpriteObj(g, toS, o, x0, y1, 1)) continue;
+        if (drawSpriteObj(g, toS, o, x0, y1, 1, rotationExtra, pulseTint)) continue;
         g.fillStyle = '#000'; g.fillRect(a.x, a.y, w, h);
-        g.fillStyle = chanColor(o) || '#fff'; g.fillRect(a.x + 2.5 * s, a.y + 2.5 * s, w - 5 * s, h - 5 * s);
+        g.fillStyle = pulseTint || chanColor(o) || '#fff'; g.fillRect(a.x + 2.5 * s, a.y + 2.5 * s, w - 5 * s, h - 5 * s);
       } else if (kind === 'deco') {
-        if (drawSpriteObj(g, toS, o, x0, y1, 0.45)) continue;     // passable: drawn faint
+        if (drawSpriteObj(g, toS, o, x0, y1, 1, rotationExtra, pulseTint)) continue;        // soliddeco sprites are fully opaque; only the fallback outline is faint
         // passable block: drawn faint with a dashed outline, no collision
-        var ga = g.globalAlpha, pc = chanColor(o);
+        var ga = g.globalAlpha, pc = pulseTint || chanColor(o);
         g.globalAlpha = ga * 0.45; g.fillStyle = pc || '#999'; g.fillRect(a.x, a.y, w, h);
         g.globalAlpha = ga; g.strokeStyle = '#000'; g.lineWidth = 2; g.setLineDash([6, 4]);
         g.strokeRect(a.x + 1, a.y + 1, w - 2, h - 2); g.setLineDash([]);
       } else if (kind === 'hazard') {
-        if (drawSpriteObj(g, toS, o, x0, y1, 1)) continue;
+        if (drawSpriteObj(g, toS, o, x0, y1, 1, rotationExtra, pulseTint)) continue;
         var hzd = LevelModel.HAZ ? LevelModel.HAZ[o.id] : null;
-        g.fillStyle = '#000';
+        g.fillStyle = pulseTint || '#000';
         if (hzd && hzd.pit) g.fillRect(a.x, toS(x0, y0 + 0.5 * fp.h * CELL).y, w, a.y - toS(x0, y0 + 0.5 * fp.h * CELL).y);
         else {
           var hc = toS(x0 + fp.w * CELL / 2, y0 + fp.h * CELL / 2), hr = 0.36 * Math.min(w, h);
@@ -983,22 +1534,22 @@
           g.fillStyle = '#fff'; g.beginPath(); g.arc(hc.x, hc.y, hr * 0.35, 0, Math.PI * 2); g.fill();
         }
       } else if (kind === 'spike') {
-        if (drawSpriteObj(g, toS, o, x0, y1, 1)) continue;
+        if (drawSpriteObj(g, toS, o, x0, y1, 1, rotationExtra, pulseTint)) continue;
         var base = toS(x0, y0), apex = toS(x0 + CELL / 2, y0 + CELL), tip = toS(x1, y0);
-        g.fillStyle = '#000';
+        g.fillStyle = pulseTint || '#000';
         g.beginPath(); g.moveTo(base.x, base.y); g.lineTo(apex.x, apex.y); g.lineTo(tip.x, tip.y);
         g.closePath(); g.fill();
       } else if (kind === 'slope') {
         if (LevelModel.DECO_SLOPE && LevelModel.DECO_SLOPE[o.id]) {
           // decoration slope: reference renders the sprite only (no collider)
-          if (drawSpriteObj(g, toS, o, x0, y1, 1)) continue;
+          if (drawSpriteObj(g, toS, o, x0, y1, 1, rotationExtra, pulseTint)) continue;
         }
         var cs = slopeCorners(o, x0, x1, y0, y1).map(function (c) { return toS(c[0], c[1]); });
         g.fillStyle = '#000';
         g.beginPath(); g.moveTo(cs[0].x, cs[0].y); g.lineTo(cs[1].x, cs[1].y); g.lineTo(cs[2].x, cs[2].y);
         g.closePath(); g.fill();
       } else if (kind === 'portal' || kind === 'speed' || kind === 'exit') {
-        if (drawSpriteObj(g, toS, o, x0, y1, 1)) continue;    // real GD portal / boost sprite
+        if (drawSpriteObj(g, toS, o, x0, y1, 1, rotationExtra, pulseTint)) continue;    // real GD portal / boost sprite
         var lbl = kind === 'exit' ? LABEL_EXIT : kind === 'speed' ? (SPEED_LABEL[o.id] || '') : (PORTAL_LABEL[LevelModel.PORTAL[o.id]] || '?');
         g.fillStyle = '#fff'; g.fillRect(a.x, a.y, w, h);
         g.strokeStyle = '#000'; g.lineWidth = 3; g.strokeRect(a.x + 2, a.y + 2, w - 4, h - 4);
@@ -1020,55 +1571,166 @@
         }
       } else if (kind === 'pad') {
         // the atlas pad frame is anchored to the pad's object centre (matches the physics band)
-        if (drawSpriteObj(g, toS, o, x0, y0 + fp.h * CELL, 1)) continue;
+        if (drawSpriteObj(g, toS, o, x0, y0 + fp.h * CELL, 1, rotationExtra, pulseTint)) continue;
         var pt = toS(x0, y0 + C.PAD_H);
         g.fillStyle = '#000'; g.fillRect(a.x, pt.y, w, a.y - pt.y);
         g.fillStyle = '#fff'; g.font = 'bold ' + Math.round(10 * s / 2) + 'px Arial, sans-serif';
         g.textAlign = 'center'; g.textBaseline = 'middle';
         g.fillText(PAD_LABEL[o.id] || '', a.x + w / 2, pt.y + (a.y - pt.y) / 2);
       } else if (kind === 'orb') {
-        if (drawSpriteObj(g, toS, o, x0, y1, 1)) continue;    // real GD orb ring sprite
-        var c = toS(x0 + CELL / 2, y0 + CELL / 2), r = 15 * s;
+        if (drawSpriteObj(g, toS, o, x0, y1, 1, rotationExtra, pulseTint)) continue;    // real GD orb ring sprite
+        var c = toS(x0 + fp.w * CELL / 2, y0 + fp.h * CELL / 2), r = 15 * s;
         g.fillStyle = '#fff'; g.beginPath(); g.arc(c.x, c.y, r, 0, Math.PI * 2); g.fill();
         g.strokeStyle = '#000'; g.lineWidth = 3; g.stroke();
         g.fillStyle = '#000'; g.font = 'bold ' + Math.round(13 * s / 2) + 'px Arial, sans-serif';
         g.textAlign = 'center'; g.textBaseline = 'middle';
         g.fillText(ORB_LABEL[o.id] || '', c.x, c.y);
       } else if (kind === 'coin') {
-        var cc = toS(x0 + CELL / 2, y0 + CELL / 2), rr = 11 * s;
-        var got = coinsGot[(x0 + CELL / 2) + ',' + (y0 + CELL / 2)];
-        if (drawSpriteObj(g, toS, o, x0, y1, got ? 0.3 : 1)) continue;   // real GD coin sprite
+        var coinX = x0 + fp.w * CELL / 2, coinY = y0 + fp.h * CELL / 2;
+        var cc = toS(coinX, coinY), rr = 11 * s;
+        var got = coinsGot[coinX + ',' + coinY];
+        if (drawSpriteObj(g, toS, o, x0, y1, got ? 0.3 : 1, rotationExtra, pulseTint)) continue;   // real GD coin sprite
         g.fillStyle = got ? '#888' : '#fff';
         g.beginPath(); g.arc(cc.x, cc.y, rr, 0, Math.PI * 2); g.fill();
         g.strokeStyle = '#000'; g.lineWidth = 3; g.stroke();
         g.beginPath(); g.arc(cc.x, cc.y, rr * 0.5, 0, Math.PI * 2); g.stroke();
       }
     }
+    // reference render order: every level object (max z depth ~13.5) is drawn BEHIND the ground
+    // tiles (depth 20), so the ground and its edge line cover object art below the line — spikes
+    // and pit hazards sink into the ground instead of floating on top of it.
+    // reference updateGroundTiles fly branch: entering a fly mode slides the ground band down to
+    // 620 - inset and drops a ceiling band in from the top to 20 + inset over 0.5 s
+    // (inset = (600 - corridorSpanPx)/2: ship/ufo/wave 0, ball 60, spider 30). At rest the bands
+    // coincide with the physics corridor edges because the camera locks its centre at y 320.
+    var bandInset = Math.max(0, (600 - flyBand.spanPx) / 2);
+    var groundTopY = gz.y, ceilBotY = null;
+    if (live && flyBand.value > 0.001) {
+      var targetGroundY = 620 - bandInset, targetCeilY = 20 + bandInset;
+      groundTopY = gz.y + (targetGroundY - gz.y) * flyBand.value;
+      if (groundTopY > gz.y) groundTopY = gz.y;   // reference clamp: never above the world line
+      ceilBotY = targetCeilY * flyBand.value;
+    }
+    var drewGround = false;
+    if (!MONO && LEVEL.groundId) {
+      var gimg = texImage(groundFileOf(LEVEL));
+      if (TEX_OK[groundFileOf(LEVEL)] && gimg.width) {
+        // reference _buildGround: the tile's top edge sits on the ground line, world-locked (no parallax)
+        drewGround = drawTintedTiled(g, gimg, groundColor(), 0, groundTopY, CW, Math.max(0, CH - groundTopY), groundX, groundTopY);
+        // reference setGround2Color: the darker inner pattern is ALWAYS drawn (channel 1009
+        // copies the ground channel 1001 when unset), not only when the header carries 1009
+        var g2 = texImage(ground2FileOf(LEVEL));
+        var g2col = LEVEL.palette ? channelColor(1009) : null;
+        if (g2col && TEX_OK[ground2FileOf(LEVEL)] && g2.width) {
+          drawTintedTiled(g, g2, g2col, 0, groundTopY, CW, Math.max(0, CH - groundTopY), groundX, groundTopY);
+        }
+      }
+    }
+    if (!drewGround) { g.fillStyle = groundColor(); g.fillRect(0, groundTopY, CW, CH - groundTopY); }
+    // reference floorLine sprite: floorLine_01 stretched to the screen width, additive, top at
+    // groundY - 1; the art carries its own soft alpha falloff (no extra alpha scaling)
+    function drawFloorLine(yLine) {
+      var prevGA = g.globalAlpha, prevGCO = g.globalCompositeOperation;
+      g.globalCompositeOperation = 'lighter';
+      var flf = FRAMES['floorLine_01_001.png'];
+      if (flf && !flf[9] && sheetImage(flf[0])) {
+        g.drawImage(SHEET_IMGS[flf[0]], flf[1], flf[2], flf[3], flf[4], 0, yLine - 1, CW, flf[4]);
+      } else {
+        g.globalAlpha = 0.9 * prevGA;
+        g.fillStyle = '#bfbfbf';
+        g.fillRect(0, yLine - 1, CW, 2);
+        g.globalAlpha = prevGA;
+      }
+      g.globalCompositeOperation = prevGCO;
+    }
+    if (live && !MONO) {
+      drawFloorLine(groundTopY);
+      // the ceiling band hangs flipped from the top, its bottom edge animated down to
+      // 20 + inset (reference updateGroundTiles rightTileIndex); needs the ground texture
+      // loaded: the demo enters ship mode before the first texture arrives
+      if (ceilBotY !== null && gimg && TEX_OK[groundFileOf(LEVEL)] && ceilBotY > -gimg.height && ceilBotY < CH) {
+        var fimg = flippedCanvas(gimg) || gimg;
+        var bandY = Math.max(0, ceilBotY - gimg.height), bandH = Math.min(ceilBotY, CH) - bandY;
+        var cg = drawTintedTiled(g, fimg, groundColor(), 0, bandY, CW, bandH, groundX, ceilBotY);
+        var f2g2col = LEVEL.palette ? channelColor(1009) : null;
+        if (cg && f2g2col && TEX_OK[ground2FileOf(LEVEL)] && g2 && g2.width) {
+          var f2 = flippedCanvas(g2) || g2;
+          drawTintedTiled(g, f2, f2g2col, 0, bandY, CW, bandH, groundX, ceilBotY);
+        }
+        drawFloorLine(ceilBotY);
+      }
+    }
     g.globalAlpha = 1;
   }
 
-  // x-sorted render window: official levels have >10k objects, and scanning all of them every
-  // frame is what made the play tab laggy on mobile. The window covers the screen plus a wide
-  // margin so group-move offsets still land inside it.
-  var OBJ_SORTED = null, OBJ_SORTED_SRC = null, OBJ_SORTED_LEN = -1;
-  var VIS_START = 0, VIS_END = 0;
-  var VIS_MARGIN = 1200;         // world units of slack for moved groups
+  // Render-order cache and two spatial indexes. Static objects only need a small
+  // viewport-sized query; grouped objects retain the original wide query window
+  // because move/rotate triggers can bring distant objects into view.
+  var RENDER_LAYER_DEPTH = { '-5': -12, '-3': -9, '-1': -6, '0': 0, '1': 3, '3': 6, '5': 9, '7': 10.5, '9': 12, '11': 13.5 };
+  function objectRenderDepth(o) {
+    var isText = LevelModel.kindOf(o.id) === 'text';
+    var layer = o.zLayer || (typeof defZLayer === 'function' ? defZLayer(o.id) : (isText ? 3 : 0));
+    var order = o.zOrder || (typeof defZOrder === 'function' ? defZOrder(o.id) : 0);
+    return (RENDER_LAYER_DEPTH[layer] !== undefined ? RENDER_LAYER_DEPTH[layer] : 0) + order * 0.01;
+  }
+  var OBJ_STATIC_X = [], OBJ_GROUPED_X = [], OBJ_ALL_DEPTH = [], OBJ_SORTED_SRC = null, OBJ_SORTED_LEN = -1, OBJ_SORTED_REV = -1;
+  var VISIBLE_BUFFER = [];
+  var GROUP_VIS_MARGIN = 1200; // retain the prior trigger-movement safety range
+  var STATIC_VIS_MARGIN = 180; // enough for the widest authored static footprints
   function rebuildSortedObjs() {
-    OBJ_SORTED = LEVEL.objs.slice().sort(function (a, b) { return a.gx - b.gx; });
-    OBJ_SORTED_SRC = LEVEL.objs;
-    OBJ_SORTED_LEN = LEVEL.objs.length;
+    var src = LEVEL.objs;
+    OBJ_STATIC_X = []; OBJ_GROUPED_X = []; OBJ_ALL_DEPTH = src.slice();
+    for (var i = 0; i < src.length; i++) {
+      var o = src[i];
+      o._renderIndex = i;
+      o._renderDepth = objectRenderDepth(o);
+      if (o.groups && o.groups.length) OBJ_GROUPED_X.push(o);
+      else OBJ_STATIC_X.push(o);
+    }
+    // x indexes are independent of draw order; the cached depth key is used only
+    // after collecting the small candidate set for this frame.
+    OBJ_STATIC_X.sort(function (a, b) { return a.gx - b.gx || a._renderIndex - b._renderIndex; });
+    OBJ_GROUPED_X.sort(function (a, b) { return a.gx - b.gx || a._renderIndex - b._renderIndex; });
+    OBJ_ALL_DEPTH.sort(function (a, b) { return a._renderDepth - b._renderDepth || a._renderIndex - b._renderIndex; });
+    OBJ_SORTED_SRC = src;
+    OBJ_SORTED_LEN = src.length;
+    OBJ_SORTED_REV = LEVEL.revision || 0;
+  }
+  function ensureRenderIndexes() {
+    if (OBJ_SORTED_SRC !== LEVEL.objs || OBJ_SORTED_LEN !== LEVEL.objs.length || OBJ_SORTED_REV !== (LEVEL.revision || 0)) rebuildSortedObjs();
+  }
+  function lowerBoundGX(arr, x) {
+    var a = 0, b = arr.length;
+    while (a < b) { var m = (a + b) >> 1; if (arr[m].gx < x) a = m + 1; else b = m; }
+    return a;
+  }
+  function appendGXRange(arr, lo, hi, out) {
+    var i = lowerBoundGX(arr, lo);
+    while (i < arr.length && arr[i].gx <= hi) out.push(arr[i++]);
   }
   function visibleObjs(playerX) {
-    if (OBJ_SORTED_SRC !== LEVEL.objs || OBJ_SORTED_LEN !== LEVEL.objs.length) rebuildSortedObjs();
-    var lo = playerX / CELL - VIS_MARGIN / CELL, hi = playerX / CELL + (CW / 2 + VIS_MARGIN) / CELL;
-    // binary search the left edge
-    var a = 0, b = OBJ_SORTED.length;
-    while (a < b) { var m = (a + b) >> 1; if (OBJ_SORTED[m].gx < lo) a = m + 1; else b = m; }
-    var start = a;
-    var end = start;
-    while (end < OBJ_SORTED.length && OBJ_SORTED[end].gx <= hi) end++;
-    VIS_START = start; VIS_END = end;
-    return OBJ_SORTED;
+    ensureRenderIndexes();
+    VISIBLE_BUFFER.length = 0;
+    // Canvas scale is 2x world units, so the visible half-width is CW/4.
+    // Keep a 180-unit static overscan for large sprites/footprints. Grouped
+    // objects use the historical 1200-unit window to preserve trigger behavior.
+    var staticHalf = CW / 4 + STATIC_VIS_MARGIN;
+    var staticLo = (playerX - staticHalf) / CELL;
+    var staticHi = (playerX + staticHalf) / CELL;
+    appendGXRange(OBJ_STATIC_X, staticLo, staticHi, VISIBLE_BUFFER);
+    var groupLo = playerX / CELL - GROUP_VIS_MARGIN / CELL;
+    var groupHi = playerX / CELL + (CW / 2 + GROUP_VIS_MARGIN) / CELL;
+    appendGXRange(OBJ_GROUPED_X, groupLo, groupHi, VISIBLE_BUFFER);
+    // Stable tie-break preserves source order for objects with identical depth.
+    // Reusing this array avoids a fresh slice/allocation on every animation frame.
+    VISIBLE_BUFFER.sort(function (a, b) {
+      return a._renderDepth - b._renderDepth || a._renderIndex - b._renderIndex;
+    });
+    return VISIBLE_BUFFER;
+  }
+  function allRenderOrder() {
+    ensureRenderIndexes();
+    return OBJ_ALL_DEPTH;
   }
 
   // ---- player icon sprites (reference player.js: base frame tinted mainColor, _2 overlay
@@ -1076,16 +1738,16 @@
   var ICON_BASE = { cube: 'player_01_001.png', ship: 'ship_01_001.png', ball: 'player_ball_01_001.png',
     ufo: 'bird_01_001.png', wave: 'dart_01_001.png', robot: 'robot_01_01_001.png', spider: 'spider_01_01_001.png', swing: 'swing_01_001.png' };
   var ICON_OVER = { cube: 'player_01_2_001.png', ship: 'ship_01_2_001.png', ball: 'player_ball_01_2_001.png',
-    ufo: 'bird_01_2_001.png', wave: 'dart_01_2_001.png', robot: 'robot_01_01_2_001.png', spider: 'spider_01_01_2_001.png', swing: 'swing_01_2_001.png' };
+    ufo: 'bird_01_3_001.png', wave: 'dart_01_2_001.png', robot: 'robot_01_01_2_001.png', spider: 'spider_01_01_2_001.png', swing: 'swing_01_2_001.png' };
   var ICON_MAIN = '#04ff00', ICON_SEC = '#00fbff';
-  function drawIconLayer(g, name, k, tint) {
+  function drawIconLayer(g, name, k, tint, oy) {
     var f = FRAMES[name];
     if (!f || f[9] || !sheetImage(f[0])) return false;
     // the icons atlas is 1x: one atlas pixel = one world unit (the cube frame is 60px = the
     // 30-unit hitbox box drawn at the 2px/unit play scale) — unlike the hd level sheets (0.5)
     var dw = f[3] * k, dh = f[4] * k;
-    var dx = (f[5] + f[3] / 2 - f[7] / 2) * k - dw / 2, dy = (f[8] / 2 - f[6] - f[4] / 2) * k - dh / 2;
-    var tc = frameTint(name, f, tint);
+    var dx = (f[5] - f[7] / 2) * k, dy = (f[6] - f[8] / 2) * k + (oy || 0);
+    var tc = tint ? frameTint(name, f, tint) : null;
     if (tc) g.drawImage(tc, 0, 0, f[3], f[4], dx, dy, dw, dh);
     else g.drawImage(sheetImage(f[0]), f[1], f[2], f[3], f[4], dx, dy, dw, dh);
     return true;
@@ -1096,37 +1758,74 @@
     var main = invert ? ICON_SEC : ICON_MAIN, sec = invert ? ICON_MAIN : ICON_SEC;
     var base = ICON_BASE[pl.mode] || ICON_BASE.cube;
     var over = ICON_OVER[pl.mode];
-    if (pl.mode === 'cube' && pl.isMini) { base = 'player_00_001.png'; over = 'player_00_2_001.png'; }
     if (base && FRAMES[base] && sheetImage(FRAMES[base][0])) {
-      // sprite icon: cube rides inside the ship / ufo at 0.55 scale (reference enterShipMode / enterUfoMode)
       g.save();
       g.translate(c.x, c.y);
-      // cube/ball spin, ship/ufo tilt and the wave's 45-degree glide are all tracked in sim
-      g.rotate(pl.mode === 'cube' || pl.mode === 'ball' || pl.mode === 'ship' || pl.mode === 'ufo' || pl.mode === 'wave' || pl.mode === 'swing' ? pl.rot : 0);
+      var k = h / 30;                                  // 30 world units = 60 atlas px
+      if (pl.mode === 'wave') g.translate((pl.mirrored ? 1.5 : -1.5) * s, -1 * s);
+      if (pl.mode === 'ship' || pl.mode === 'ufo') {
+        // Port of Web Dashers player.js syncSprites(): the vehicle is native scale,
+        // while the cube nested inside it is 0.55 scale. k already includes mini scaling.
+        var miniS = pl.isMini ? 0.6 : 1;
+        var mir = pl.mirrored ? -1 : 1;
+        var grav = pl.flip ? -1 : 1;
+        var angle = pl.mode === 'ship' ? pl.rot : 0;
+        var cubeOffset = pl.flip ? -30 * miniS : 10 * miniS;
+        var cubeX = cubeOffset * Math.sin(angle) * mir;
+        var cubeY = -cubeOffset * Math.cos(angle) + (pl.isMini ? 8 * miniS : 0) + (pl.flip ? -20 * miniS : 0);
+        var vehicleX = -10 * Math.sin(angle) * mir;
+        var ufoDelta = pl.frameDeltaY !== undefined ? pl.frameDeltaY : (pl.y - pl.lastY);
+        var ufoTilt = Math.max(-0.05, Math.min(0.05, -ufoDelta * 0.016));
+        var vehicleY = pl.mode === 'ship'
+          ? 10 * Math.cos(angle) + (pl.flip ? -20 * miniS : 0)
+          : 10 + (pl.flip ? -15 : 5);
+        var vehicleRot = pl.mode === 'ship' ? (mir < 0 ? -angle : angle) : ufoTilt;
+        var cubeRot = pl.mode === 'ship' ? (mir < 0 ? -angle : angle) : 0;
+        var cubeBase = ICON_BASE.cube;
+        var cubeOver = ICON_OVER.cube;
+        if (pl.mode === 'ufo') vehicleRot = mir < 0 ? -ufoTilt : ufoTilt;
+        function layerAt(name, tint, scale, x, y, rotation) {
+          if (!name || !FRAMES[name]) return;
+          g.save();
+          g.translate(x, y);
+          if (rotation) g.rotate(rotation);
+          g.scale(mir, grav);
+          drawIconLayer(g, name, scale, tint, 0);
+          g.restore();
+        }
+        // Match Web Dashers depth order: both secondary overlays (8), then both
+        // main sprites (10), then any untinted extra layer (12).
+        layerAt(cubeOver, sec, k * 0.55, cubeX, cubeY, cubeRot);
+        if (pl.mode === 'ship') layerAt('ship_01_2_001.png', sec, k, vehicleX, vehicleY, vehicleRot);
+        else layerAt('bird_01_3_001.png', sec, k, vehicleX, vehicleY, vehicleRot);
+        layerAt(cubeBase, main, k * 0.55, cubeX, cubeY, cubeRot);
+        if (pl.mode === 'ship') {
+          layerAt('ship_01_001.png', main, k, vehicleX, vehicleY, vehicleRot);
+          layerAt('ship_01_extra_001.png', null, k, vehicleX, vehicleY, vehicleRot);
+        } else {
+          // Web Dashers bird_2 is the disabled glow layer; bird_3 is the overlay.
+          layerAt('bird_01_001.png', main, k, vehicleX, vehicleY, vehicleRot);
+          layerAt('bird_01_extra_001.png', null, k, vehicleX, vehicleY, vehicleRot);
+        }
+        g.restore();
+        return;
+      }
+      // reference syncSprites: rotation negates while mirrored
+      g.rotate((pl.mode === 'cube' || pl.mode === 'ball' || pl.mode === 'wave' || pl.mode === 'swing' ? pl.rot : 0) * (pl.mirrored ? -1 : 1));
       if (pl.flip) g.scale(1, -1);
       if (pl.mirrored) g.scale(-1, 1);
-      var k = h / 30;                                  // 30 world units = 60 atlas px
-      if (pl.mode === 'ship' || pl.mode === 'ufo') {
-        // reference enterShipMode / enterUfoMode: every player layer scales 0.55, and the
-        // cube icon stays visible riding inside the vehicle (setCubeVisible stays true)
-        var fk = k * 0.55;
-        var cb = pl.isMini ? 'player_00_001.png' : ICON_BASE.cube;
-        var co = pl.isMini ? 'player_00_2_001.png' : ICON_OVER.cube;
-        drawIconLayer(g, cb, fk, main);
-        drawIconLayer(g, co, fk, sec);
-        drawIconLayer(g, base, fk, main);
-        if (over) drawIconLayer(g, over, fk, sec);
-      } else {
-        drawIconLayer(g, base, k, main);
-        if (over) drawIconLayer(g, over, k, sec);
-      }
+      if (pl.mode === 'wave') k *= 0.94;               // reference syncSprites: fix wave size
+      if (over) drawIconLayer(g, over, k, sec, 0);
+      drawIconLayer(g, base, k, main, 0);
+      var xb = base.replace('_001.png', '_extra_001.png');
+      if (FRAMES[xb]) drawIconLayer(g, xb, k, null, 0);
       g.restore();
       return;
     }
     // vector fallback when the icon sheet has not loaded
     g.save();
     g.translate(c.x, c.y);
-    g.rotate(pl.rot);
+    g.rotate(pl.mirrored ? -pl.rot : pl.rot);
     if (pl.flip) g.scale(1, -1);
     if (pl.mirrored) g.scale(-1, 1);
     var fg = invert ? '#fff' : '#000', bg = invert ? '#000' : '#fff';
@@ -1173,8 +1872,71 @@
 
   // ---- play rendering ----
   function playToS(x1, y1) {
-    return { x: CENTER_X + 2 * (x1 - p.x), y: playCamY + GROUND_SY - 2 * y1 };
+    var sx = CENTER_X + 2 * (x1 - p.x);
+    // reference mirror: x' = x + p * (screenWidth - 2x) — the world reflects around the screen
+    // centre while the flip animates and stays fully reflected at rest (container scaleX -1)
+    var mp = mirrorProgress();
+    if (mp > 0) sx += mp * (CW - 2 * sx);
+    return { x: sx, y: playCamY + GROUND_SY - 2 * y1 };
   }
+  // push settings into the sim and the toggle buttons, then redraw
+  function setSettingButton(id, on, label) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = label + ': ' + (on ? 'ON' : 'OFF');
+    el.setAttribute('aria-pressed', on ? 'true' : 'false');
+    el.className = on ? 'selected' : '';
+  }
+  function syncSettings() {
+    GS.setNoclip(showNoclip);
+    setSettingButton('set-noclip', showNoclip, 'NOCLIP');
+    setSettingButton('set-hitboxes', showHitboxes, 'HITBOXES');
+    setSettingButton('set-percent', showPercent, 'PERCENT');
+    dirty = true;
+  }
+
+  // ---- hitbox overlay (Show Hitboxes). Solid lines: solids. Dashed: hazards. Player: thick outer box, thin inner box.
+  // white halo under every outline so black lines stay readable on black sprites
+  function strokeBoxWorld(x0, x1, y0, y1, dashed, lw) {
+    var a = playToS(x0, y1), b = playToS(x1, y0);
+    var w = b.x - a.x, h = b.y - a.y;
+    ctx.setLineDash([]);
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = lw + 2;
+    ctx.strokeRect(a.x, a.y, w, h);
+    ctx.strokeStyle = '#000'; ctx.lineWidth = lw;
+    ctx.setLineDash(dashed ? [6, 4] : []);
+    ctx.strokeRect(a.x, a.y, w, h);
+  }
+  function drawHitboxes(lv) {
+    var lo = p.x - CENTER_X / 2 - 60, hi = p.x + (CW - CENTER_X) / 2 + 60;
+    var i, o, c, r;
+    ctx.strokeStyle = '#000';
+    for (i = 0; i < lv.solids.length; i++) {
+      o = lv.solids[i];
+      if (o.x0 < -1e8 || o.x1 < lo || o.x0 > hi) continue;      // skip the infinite ground and off-screen blocks
+      strokeBoxWorld(o.x0, o.x1, o.y0, o.y1, false, 1.5);
+    }
+    for (i = 0; i < lv.spikes.length; i++) {
+      o = lv.spikes[i];
+      if (o.cx < lo || o.cx > hi) continue;
+      if (o.r !== undefined) {
+        c = playToS(o.cx, o.cy);
+        r = o.r * 2;
+        ctx.setLineDash([]); ctx.strokeStyle = '#fff'; ctx.lineWidth = 3.5;
+        ctx.beginPath(); ctx.arc(c.x, c.y, r, 0, Math.PI * 2); ctx.stroke();
+        ctx.strokeStyle = '#000'; ctx.lineWidth = 1.5; ctx.setLineDash([6, 4]);
+        ctx.beginPath(); ctx.arc(c.x, c.y, r, 0, Math.PI * 2); ctx.stroke();
+      } else {
+        strokeBoxWorld(o.x0, o.x1, o.y0, o.y1, true, 1.5);
+      }
+    }
+    // outer box = the collision box the sim actually uses (wave is 4.5 half-size, mini 9 or 3)
+    var PH = p.mode === 'wave' ? (p.isMini ? 3 : 4.5) : p.half;
+    strokeBoxWorld(p.x - PH, p.x + PH, p.y - PH, p.y + PH, false, 3);
+    strokeBoxWorld(p.x - p.inner, p.x + p.inner, p.y - p.inner, p.y + p.inner, false, 1.5);
+    ctx.setLineDash([]); ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
+  }
+
   function renderPlay() {
     var drewTex = false;
     if (!MONO && LEVEL.bgId) {
@@ -1182,7 +1944,7 @@
       if (m) {
         // reference _updateBackground: parallax 0.1x horizontally, 0.1x vertically, wrapped over the mirror pair.
         // Phaser tileSprite shows texture row (tilePosition + screenRow): the pattern anchor is the NEGATED tilePosition
-        var tx = 0.1 * 2 * p.x, ty = (1024 - CH - REF_O) - 0.1 * playCamY;
+        var tx = 0.1 * bgScrollPx, ty = (1024 - CH - REF_O) - 0.1 * playCamY;
         drewTex = drawTintedTiled(ctx, m, bgColor(), 0, 0, CW, CH, -tx, -ty);
       }
     }
@@ -1190,6 +1952,7 @@
     drawWorld(ctx, playToS, 2, true);
     drawPlayer(ctx, playToS, 2, p, false);
     if (p2) drawPlayer(ctx, playToS, 2, p2, true);
+    if (showHitboxes) drawHitboxes(LEVEL.sim());
     ctx.fillStyle = '#000';
     ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
     ctx.font = '15px Arial, sans-serif';
@@ -1204,6 +1967,12 @@
     ctx.fillRect(CW - 260, 12, 246 * prog, 8);
     ctx.textAlign = 'right';
     ctx.fillText('Attempt ' + attempts, CW - 12, 42);
+    if (showNoclip) { ctx.textAlign = 'left'; ctx.fillText('NOCLIP', 12, 42); }
+    if (showPercent) {
+      ctx.textAlign = 'center'; ctx.font = 'bold 15px Arial, sans-serif';
+      ctx.fillText(Math.floor(prog * 100) + '%', CW / 2, 22);
+      ctx.font = '15px Arial, sans-serif';
+    }
     ctx.textAlign = 'center';
     if (demoActive) box(['Demo run', 'Press any key to take over']);
     else if (status === 'ready') box([LEVEL_NAME, 'Press to start. Then hold to jump or fly.']);
@@ -1274,6 +2043,7 @@
   }
   function setObjs(json) {
     LEVEL.objs = JSON.parse(json);
+    LEVEL.revision = (LEVEL.revision || 0) + 1;
     LEVEL.dirty = true;
     levelIsDefault = false;
     clearSelection();
@@ -1316,6 +2086,7 @@
     if (!selection.length) return;
     beginStroke();
     LEVEL.objs = LEVEL.objs.filter(function (o) { return selectedIndex(o) < 0; });
+    LEVEL.revision = (LEVEL.revision || 0) + 1;
     LEVEL.dirty = true;
     clearSelection();
     endStroke();
@@ -1417,6 +2188,7 @@
       r.o.gx = Math.max(0, r.gx + dx) ;
       r.o.gy = Math.max(0, r.gy + dy);
     });
+    LEVEL.revision = (LEVEL.revision || 0) + 1;
     LEVEL.dirty = true;
     dirty = true;
   }
@@ -1653,6 +2425,10 @@
     click('btn-redo', redo);
     click('btn-clear', function () { beginStroke(); LEVEL.clear(); clearSelection(); endStroke(); levelIsDefault = false; dirty = true; flash('Cleared.'); });
     click('btn-reset', function () { loadLevel(levelIdx); flash('Restored ' + LEVELS[levelIdx].name + '.'); });
+    click('set-noclip', function () { showNoclip = !showNoclip; syncSettings(); });
+    click('set-hitboxes', function () { showHitboxes = !showHitboxes; syncSettings(); });
+    click('set-percent', function () { showPercent = !showPercent; syncSettings(); });
+    syncSettings();
 
     var fileIn = document.getElementById('gmd-file');
     if (fileIn) fileIn.onchange = function () {
@@ -1674,12 +2450,18 @@
     markTool();
 
     // test hook for the headless harness
-    window.CubeDashDebug = {
+    window.RRDebug = {
       advanceFrame: advanceFrame, startDemo: startDemo, resetRun: resetRun,
       startPlay: function () { resetRun(); status = 'ready'; }, pressJump: pressJump, releaseJump: releaseJump,
       getStatus: function () { return status; }, getPlayer: function () { return p; }, getPlayer2: function () { return p2; },
       groupInfo: function (g) { return groupInfo([g]); }, getGroupState: function () { return groupState; },
       getLevel: function () { return LEVEL; }, setLevel: function (l) { LEVEL = l; levelIsDefault = false; snapshotPalette(); },
+      // test hook: read/park the play camera Y (screen px, reference _cameraY semantics)
+      getCamY: function () { return playCamY; }, setCamY: function (v) { playCamY = v; dirty = true; },
+      // test hook: mirror flip progress and fly band state (reference _mirrorP / _groundTargetValue)
+      getMirrorP: function () { return mirrorProgress(); },
+      getFlyBand: function () { return { on: flyBand.on, value: flyBand.value, spanPx: flyBand.spanPx }; },
+      toggleMirror: function (on) { toggleMirror(on); },
       endX: endX, setTab: setTab, doImport: doImport, loadLevel: loadLevel, levels: LEVELS,
       setTool: function (i) { toolIndex = i; }, tools: TOOLS, selection: function () { return selection; },
       selectRect: selectRect, deleteSelection: deleteSelection, copySelection: copySelection, pasteAt: pasteAt,
@@ -1699,20 +2481,24 @@
             p.x = Math.min(x, p.x + 10);
           }
         }
+        // parked-camera hook: sync the camera-delta accumulators so the background phase matches
+        // a real run that travelled to this x (no mirror assumed while parking)
+        bgScrollPx = 2 * (p ? p.x : 0); prevCamPx = bgScrollPx;
+        mirAnim.animating = false; mirAnim.p = mirAnim.to;
         updatePlayCamera(true); dirty = true;
       },
       setFrozen: function (v) { frozen = !!v; },
-      // real-run parking: noclip walk from the level start, one real sim frame at a time,
-      // so colour tweens / move / spawn triggers progress exactly like an actual attempt
-      setNoclip: function (v) { GameSim.setNoclip(!!v); },
-      runTo: function (x) {
+      // parked run: teleport to (x0,y0) mid-attempt WITHOUT resetting accumulated visual state
+      // (mirror progress, bg scroll, ground shift), then noclip-walk to x1 — for A/B captures
+      runFrom: function (x0, y0, x1) {
         GameSim.setNoclip(true);
         frozen = false; holding = false; pressQueued = false;
-        resetRun(); status = 'play';
+        if (status !== 'play') status = 'play';
+        if (p) { p.x = x0; p.y = y0; p.vy = 0; p.rot = 0; p.dead = false; }
         var guard = 0;
-        while (guard++ < 80000 && p && p.x < x) {
+        while (guard++ < 80000 && p && p.x < x1) {
           advanceFrame();
-          if (status === 'dead' && p) {         // noclip only skips collisions; out-of-bounds still resets
+          if (status === 'dead' && p) {
             p.dead = false; p.vy = 0; p.y = Math.min(Math.max(p.y, 120), 900); status = 'play';
           }
           if (status === 'won') break;
@@ -1721,6 +2507,32 @@
         GameSim.setNoclip(false);
         updatePlayCamera(true); dirty = true;
         return { x: p && p.x, y: p && p.y, mode: p && p.mode, flip: p && p.flip };
+      },
+      // test hooks: force the camera-delta accumulators (pattern phase alignment for A/B shots)
+      setBgScroll: function (px) { bgScrollPx = px; prevCamPx = 2 * (p ? p.x : 0); },
+      setGroundShift: function (px) { groundShiftPx = px; dirty = true; },
+      // real-run parking: noclip walk from the level start, one real sim frame at a time,
+      // so colour tweens / move / spawn triggers progress exactly like an actual attempt.
+      // opt.record: return the per-frame (x2px, y2px, mode, flip) trajectory for A/B tracing
+      setNoclip: function (v) { GameSim.setNoclip(!!v); },
+      runTo: function (x, opt) {
+        var rec = [];
+        GameSim.setNoclip(true);
+        frozen = false; holding = false; pressQueued = false;
+        resetRun(); status = 'play';
+        var guard = 0;
+        while (guard++ < 80000 && p && p.x < x) {
+          advanceFrame();
+          if (opt && opt.record) rec.push([+(p.x * 2).toFixed(2), +(p.y * 2).toFixed(2), p.mode, p.flip ? 1 : 0]);
+          if (status === 'dead' && p) {         // noclip only skips collisions; out-of-bounds still resets
+            p.dead = false; p.vy = 0; p.y = Math.min(Math.max(p.y, 120), 900); status = 'play';
+          }
+          if (status === 'won') break;
+        }
+        frozen = true;
+        GameSim.setNoclip(false);
+        updatePlayCamera(true); dirty = true;
+        return { x: p && p.x, y: p && p.y, mode: p && p.mode, flip: p && p.flip, traj: rec };
       },
       triggerColour: startTriggers
     };

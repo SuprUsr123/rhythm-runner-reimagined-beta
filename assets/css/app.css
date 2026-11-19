@@ -107,6 +107,11 @@ canvas {
   gap: 5px; margin-top: 8px;
 }
 #view-play .row button { width: 100%; }
+#settings {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px; margin-top: 8px;
+}
+#settings button { width: 100%; margin: 0; font-size: 12px; }
 #view-edit > .row:first-of-type {
   display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px;
 }
@@ -148,6 +153,7 @@ textarea {
 }
 @media (max-width: 380px) {
   body { padding: 6px; }
+  #settings { grid-template-columns: minmax(0, 1fr); }
   .window-content { padding: 8px; }
   #view-play, #view-edit { padding: 7px; }
   #tools { grid-template-columns: repeat(2, minmax(0, 1fr)); }
