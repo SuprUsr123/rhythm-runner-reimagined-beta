@@ -30,6 +30,8 @@
     <div id="settings" role="group" aria-label="Settings">
       <button id="set-noclip" type="button" aria-pressed="false">NOCLIP: OFF</button>
       <button id="set-hitboxes" type="button" aria-pressed="false">HITBOXES: OFF</button>
+      <button id="set-clear-assets" type="button">CLEAR ASSETS</button>
+      <button id="set-quality" type="button">GRAPHICS: LOW</button>
       <button id="set-percent" type="button" aria-pressed="true">PERCENT: ON</button>
     </div>
     <p class="note">Desktop: Space jumps or flies. Speed portals change the run speed, pads and orbs launch you, slopes are walkable. Noclip ignores hazards and deadly sides. Hitboxes outline the player (thick box is the outer hitbox, small box is the inner one), solids (solid line) and hazards (dashed line).</p>
@@ -73,12 +75,23 @@
 <script src="assets/js/data/children.js?v=4"></script>
 <script src="assets/js/data/wd-colliders.js?v=2"></script>
 <script src="assets/js/data/sheets.js?v=6"></script>
-<script src="assets/js/data/frames.js?v=7"></script>
+<script>
+    // graphics tier: "sd" = Low (default, half-resolution atlases), "hd" = High. Read before the frame table loads.
+    (function () {
+      var t = 'sd';
+      try { t = localStorage.getItem('rr_tier') || 'sd'; } catch (e) { t = 'sd'; }
+      if (t !== 'hd' && t !== 'sd') t = 'sd';
+      window.RR_TIER = t;
+      document.write('<script src="assets/js/data/frames-' + t + '.js?v=1"><\/script>');
+    })();
+  </script>
 <script src="assets/js/data/glow.js?v=1"></script>
-<script src="assets/js/sim.js?v=5"></script>
-<script src="assets/js/level-model.js?v=13"></script>
-<script src="assets/js/data/levels.js?v=3"></script>
+<script src="assets/js/data/skeletons.js?v=1"></script>
+<script src="assets/js/data/zdefaults.js?v=1"></script>
+<script src="assets/js/sim.js?v=8"></script>
+<script src="assets/js/level-model.js?v=14"></script>
+<script src="assets/js/data/levels.js?v=4"></script>
 <script src="assets/js/data/decor.js?v=3"></script>
-<script src="assets/js/game.js?v=34"></script>
+<script src="assets/js/game.js?v=44"></script>
 </body>
 </html>

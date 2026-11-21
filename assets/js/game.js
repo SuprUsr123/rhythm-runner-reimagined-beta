@@ -18,7 +18,9 @@
     });
   }
   BUILTIN.forEach(function (b) { LEVELS.push({ group: 'BUILT-IN', name: b.name, builtin: true, template: b.template, rle: b.rle }); });
-  OFFICIAL.forEach(function (o) { LEVELS.push({ group: 'OFFICIAL', name: o.name, builtin: false, data: o.data, creator: o.creator, stars: o.stars, coins: o.coins }); });
+  // official levels are streamed: the level string lives in assets/levels/<key>.txt and is fetched when the level
+  // is chosen, then dropped again when it is no longer near the current level (see unloadStreamedLevels)
+  OFFICIAL.forEach(function (o) { LEVELS.push({ group: 'OFFICIAL', name: o.name, builtin: false, data: null, stream: o.stream, creator: o.creator, stars: o.stars, coins: o.coins }); });
   var levelIdx = 0;
   var LEVEL = LevelModel.fromTemplate(LEVELS[0].template);
   var LEVEL_NAME = LEVELS[0].name;
@@ -95,7 +97,35 @@
     spawn(); updatePlayCamera(true); startTriggers();
   }
 
+  // drop streamed level strings that are not the current level or its neighbours
+  function unloadStreamedLevels(keep) {
+    for (var k = 0; k < LEVELS.length; k++) {
+      if (!LEVELS[k].stream || k === keep || k === keep - 1 || k === keep + 1) continue;
+      LEVELS[k].data = null;
+    }
+  }
+  var levelFetchToken = 0;
+  function loadStreamedLevel(i) {
+    var L = LEVELS[i];
+    var token = ++levelFetchToken;
+    flash('Loading ' + L.name + '...');
+    fetch(L.stream, { cache: 'no-cache' }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.text();
+    }).then(function (txt) {
+      L.data = txt;
+      if (token !== levelFetchToken) return;      // a newer selection superseded this fetch
+      unloadStreamedLevels(i);
+      loadLevel(i);
+      dirty = true;
+    }).catch(function () {
+      flash('Could not load ' + L.name + '. Serve the game over http (not file://).');
+    });
+  }
+
   function loadLevel(i) {
+    var L0 = LEVELS[i];
+    if (!L0.builtin && !L0.data && L0.stream) { loadStreamedLevel(i); return; }
     levelIdx = i;
     var L = LEVELS[i];
     if (L.builtin) {
@@ -365,7 +395,22 @@
       rotation += s.rotation || 0;
       if (s.centerGroup > 0) {
         centerGroup = s.centerGroup;
-        if (groupCenterCache[s.centerGroup]) pivot = groupCenterCache[s.centerGroup];
+        if (groupCenterCache[s.centerGroup]) {
+          // Resolve the live pivot once so rendering and physics use exactly the same
+          // point while the centre group itself is being moved.
+          var basePivot = groupCenterCache[s.centerGroup];
+          var pivotX = basePivot.x, pivotY = basePivot.y;
+          var pivotState = groupState[s.centerGroup];
+          if (pivotState) {
+            pivotX += pivotState.bx; pivotY += pivotState.by;
+            for (var pj = 0; pj < pivotState.tweens.length; pj++) {
+              var pt = pivotState.tweens[pj];
+              var pfrac = easingSample(pt.easingType, pt.easingRate, Math.min(1, pt.t / pt.dur));
+              pivotX += pt.dx * pfrac; pivotY += pt.dy * pfrac;
+            }
+          }
+          pivot = { x: pivotX, y: pivotY };
+        }
         lockRotation = !!s.lockRotation;
       }
       if (s.pulses && s.pulses.length) pulseTint = s.pulses[s.pulses.length - 1].tint || pulseTint;
@@ -829,13 +874,61 @@
   // ---- background / ground textures (reference game-scene _bg tileSprite + _buildGround) ----
   // texture key kA6 -> file game_bg_<kA6 + 1>_001-hd.png ; kA7 -> groundSquare_0<kA7>_001.png
   var TEX_IMG = {}, TEX_OK = {};
+  // Bounded LRU for derived canvases (tint / flip / grey). Every colour a colour trigger passes
+  // through is a new key, so these maps must not grow for the life of the tab: beyond the limit the
+  // least recently used canvases are dropped and the browser can reclaim their backing stores.
+  var CANVAS_CACHE_BYTES = 48 * 1024 * 1024;
+  var canvasCache = { map: {}, order: [], bytes: 0, sizes: {} };
+  function cacheGet(key) {
+    var c = canvasCache.map[key];
+    if (c === undefined) return undefined;
+    var idx = canvasCache.order.indexOf(key);
+    if (idx >= 0 && idx < canvasCache.order.length - 1) { canvasCache.order.splice(idx, 1); canvasCache.order.push(key); }
+    return c;
+  }
+  function cachePut(key, canvas) {
+    var bytes = (canvas.width || 0) * (canvas.height || 0) * 4;
+    if (canvasCache.map[key] !== undefined) {
+      canvasCache.bytes -= canvasCache.sizes[key] || 0;
+      canvasCache.order.splice(canvasCache.order.indexOf(key), 1);
+    }
+    canvasCache.order.push(key);
+    canvasCache.map[key] = canvas;
+    canvasCache.sizes[key] = bytes;
+    canvasCache.bytes += bytes;
+    // evict least recently used until under the byte budget (never the canvas just stored)
+    while (canvasCache.bytes > CANVAS_CACHE_BYTES && canvasCache.order.length > 1) {
+      var old = canvasCache.order.shift();
+      canvasCache.bytes -= canvasCache.sizes[old] || 0;
+      delete canvasCache.map[old]; delete canvasCache.sizes[old];
+    }
+    return canvas;
+  }
+  function clearCanvasCache() { canvasCache = { map: {}, order: [], bytes: 0, sizes: {} }; }
+
+  // Drops every image and derived canvas that was built lazily (sprite atlases, ground/background
+  // textures, tint and flip canvases, child caches) so the next frame re-requests them fresh.
+  function clearAssetCaches() {
+    ASSET_EPOCH++;
+    SHEET_IMGS = []; SHEET_OK = [];
+    TEX_IMG = {}; TEX_OK = {};
+    MIRROR_CANVAS = {};
+    clearCanvasCache();
+    SPRITE_GREY = {}; TINTED = {};
+    clearCanvasCache();
+    WHITE_INK = {};
+    LIGHT_BG_CACHE = { key: null, val: null };
+    CHILD_ORDER_CACHE = {}; LEGACY_CHILD_CACHE = {};
+    dirty = true;
+    return ASSET_EPOCH;
+  }
   function texImage(file) {
     if (TEX_IMG[file] !== undefined) return TEX_IMG[file];
     var im = new Image();
     if (typeof Image !== 'undefined') {
       im.onload = function () { TEX_OK[file] = true; dirty = true; };
       im.onerror = function () { TEX_OK[file] = false; };
-      im.src = 'assets/sprites/tex/' + file;
+      im.src = assetUrl('assets/sprites/tex/' + file);
     }
     TEX_IMG[file] = im;
     return im;
@@ -858,12 +951,10 @@
     MIRROR_CANVAS[file] = c;
     return c;
   }
-  var TINTED_TEX = {};
   // vertically flipped copy of a texture (the reference ceiling tiles are the ground tiles setFlipY)
-  var FLIP_TEX = {};
   function flippedCanvas(src) {
     var key = src.__tkey || (src.__tkey = Math.random());
-    if (FLIP_TEX[key]) return FLIP_TEX[key];
+    var hitF = cacheGet('f:' + key); if (hitF) return hitF;
     if (!src.width) return null;
     var c = document.createElement('canvas');
     c.width = src.width; c.height = src.height;
@@ -871,12 +962,11 @@
     t.translate(0, src.height);
     t.scale(1, -1);
     t.drawImage(src, 0, 0);
-    FLIP_TEX[key] = c;
-    return c;
+    return cachePut('f:' + key, c);
   }
   function tintedCanvas(src, col) {
     var key = (src.__tkey || (src.__tkey = Math.random())) + ':' + col;
-    if (TINTED_TEX[key]) return TINTED_TEX[key];
+    var hitT = cacheGet('t:' + key); if (hitT) return hitT;
     var c = document.createElement('canvas');
     c.width = src.width; c.height = src.height;
     var t = c.getContext('2d');
@@ -886,8 +976,7 @@
     t.fillRect(0, 0, c.width, c.height);
     t.globalCompositeOperation = 'destination-in';
     t.drawImage(src, 0, 0);
-    TINTED_TEX[key] = c;
-    return c;
+    return cachePut('t:' + key, c);
   }
   function bgFileOf(level) {
     var id = level.bgId ? (level.bgId <= 1 ? 1 : level.bgId) : 1;
@@ -908,9 +997,11 @@
   // alignment as the reference tileSprite's tilePosition
   function drawTintedTiled(g, src, col, x, y, w, h, phaseX, phaseY) {
     if (!src || !col || w <= 0 || h <= 0) return false;
-    var t = tintedCanvas(src, col);
+    // if the tinted copy can't be made (memory pressure), tile the plain texture so the ground never vanishes
+    var t = tintedCanvas(src, col) || src;
     var pat = g.createPattern(t, 'repeat');
-    if (!pat) return false;
+    if (!pat && t !== src) { t = src; pat = g.createPattern(src, 'repeat'); }
+    if (!pat) { g.fillStyle = col; g.fillRect(x, y, w, h); return true; }
     var a = (phaseX !== undefined ? phaseX : x) % t.width;
     var b = (phaseY !== undefined ? phaseY : y) % t.height;
     // the old code over-filled by a tile on every side, which painted the ground pattern over
@@ -952,7 +1043,7 @@
   function tintedSprite(A, col) {
     if (!col || !spriteIsGrey(A)) return null;
     var key = A[0] + ':' + A[1] + ':' + A[2] + ':' + A[3] + ':' + A[4] + ':' + col;
-    if (TINTED[key]) return TINTED[key];
+    var hit = cacheGet('s:' + key); if (hit) return hit;
     var src = SHEET_IMG[A[0]], sw = A[3], sh = A[4];
     var c = document.createElement('canvas');
     c.width = sw; c.height = sh;
@@ -963,8 +1054,7 @@
     t.fillRect(0, 0, sw, sh);
     t.globalCompositeOperation = 'destination-in';
     t.drawImage(src, A[1], A[2], sw, sh, 0, 0, sw, sh);
-    TINTED[key] = c;
-    return c;
+    return cachePut('s:' + key, c);
   }
 
   // ---- animated saws (Web Dashers game-scene.js: deltaTime * 0.003) ----
@@ -1000,32 +1090,34 @@
   // ---- atlas sprites (ZainojdafMod / Web Dashers art). Sheets load once; frames are cut from them ----
   var SPRITE_UNIT = 0.5;                     // world units per atlas pixel (the hd atlases used here)
   var SHEET_IMGS = [];
+  // bumped by clearAssetCaches(): images requested after a clear get a ?r= query so the browser's
+  // HTTP cache can't hand back the old atlas. Normal loading (epoch 0) uses the plain paths.
+  var ASSET_EPOCH = 0;
+  function assetUrl(path) { return ASSET_EPOCH ? path + '?r=' + ASSET_EPOCH : path; }
   function sheetImage(si) {
     if (!SHEET_IMGS[si]) {
       var im = new Image();
-      im.onload = function () { dirty = true; FRAME_TINTS = {}; FRAME_TINT_COUNT = 0; };  // drop tint canvases made before this atlas was ready
+      im.onload = function () { dirty = true; clearCanvasCache(); };  // drop tint canvases made before this atlas was ready
       // data URIs keep the canvas untainted on file:// (same-origin), which getImageData needs
       if (typeof SPRITE_SHEET_DATA !== 'undefined' && SPRITE_SHEET_DATA[si]) {
         im.src = SPRITE_SHEET_DATA[si];
         SPRITE_SHEET_DATA[si] = null;        // the Image owns its src copy now; free the string
       } else {
-        im.src = SPRITE_SHEETS[si];
+        im.src = assetUrl(SPRITE_SHEETS[si]);
       }
       SHEET_IMGS[si] = im;
     }
     return SHEET_IMGS[si].complete && SHEET_IMGS[si].naturalWidth > 0 ? SHEET_IMGS[si] : null;
   }
   // channel tint, the same as Phaser's setTint used by Web Dashers: multiply, then keep the frame's alpha
-  var FRAME_TINTS = {}, FRAME_TINT_COUNT = 0;
   function frameTint(name, f, col) {
     var key = name + '|' + col;
-    if (FRAME_TINTS[key]) return FRAME_TINTS[key];
-    if (FRAME_TINT_COUNT > 800) { FRAME_TINTS = {}; FRAME_TINT_COUNT = 0; }
+    var hitFT = cacheGet('ft:' + key); if (hitFT) return hitFT;
     var img = SHEET_IMGS[f[0]];
     // the sheet may still be decoding: tinting an empty image would produce (and cache) a
     // fully transparent canvas (destination-in with an empty source clears everything), so
     // bail out until the atlas has loaded — the caller falls back to the untinted frame
-    if (!img || !img.complete || !img.naturalWidth) return null;
+    if (!img || !img.complete || !img.naturalWidth || !f[3] || !f[4]) return null;
     var c = document.createElement('canvas');
     c.width = f[3]; c.height = f[4];
     var t = c.getContext('2d');
@@ -1033,8 +1125,7 @@
     t.globalCompositeOperation = 'multiply'; t.fillStyle = col; t.fillRect(0, 0, f[3], f[4]);
     t.globalCompositeOperation = 'destination-in';
     t.drawImage(img, f[1], f[2], f[3], f[4], 0, 0, f[3], f[4]);
-    FRAME_TINTS[key] = c; FRAME_TINT_COUNT++;
-    return c;
+    return cachePut('ft:' + key, c);
   }
   // sprites that are pure white in the sheet (small spikes, ice spikes, clouds, decorative
   // spikes ...) would vanish on the white background: like the Web Dashers' black silhouettes
@@ -1065,8 +1156,9 @@
     return v;
   }
   function drawAtlasCrop(g, f, src, x, y, sx, sy) {
-    if (src) g.drawImage(src, 0, 0, f[3], f[4], x, y, f[3] * sx, f[4] * sy);
-    else g.drawImage(SHEET_IMGS[f[0]], f[1], f[2], f[3], f[4], x, y, f[3] * sx, f[4] * sy);
+    var fsc = f[10] || 1;   // SD-tier sheets: source pixels are half the logical (HD) size
+    if (src) g.drawImage(src, 0, 0, f[3], f[4], x, y, f[3] * fsc * sx, f[4] * fsc * sy);
+    else g.drawImage(SHEET_IMGS[f[0]], f[1], f[2], f[3], f[4], x, y, f[3] * fsc * sx, f[4] * fsc * sy);
   }
 
   // A packed atlas frame is often only the trimmed visible portion of a larger sprite.
@@ -1076,13 +1168,15 @@
   function framePlacement(f, kx, ky, unit) {
     // centre of the trimmed frame relative to the untrimmed source centre (both axes, same convention),
     // so front and back halves of a portal land on the same oval
-    var sw = f[7] || f[3], sh = f[8] || f[4];
+    var fsc = f[10] || 1;
+    var lw = f[3] * fsc, lh = f[4] * fsc;          // logical (HD-unit) size; source pixels may be smaller
+    var sw = f[7] || lw, sh = f[8] || lh;
     var tx = f[5] || 0, ty = f[6] || 0;
     return {
-      x: (tx + f[3] / 2 - sw / 2) * unit * kx,
-      y: (ty + f[4] / 2 - sh / 2) * unit * ky,
-      w: f[3] * unit * kx,
-      h: f[4] * unit * ky
+      x: (tx + lw / 2 - sw / 2) * unit * kx,
+      y: (ty + lh / 2 - sh / 2) * unit * ky,
+      w: lw * unit * kx,
+      h: lh * unit * ky
     };
   }
 
@@ -1118,7 +1212,7 @@
     // children sit behind the parent; zero/positive-z children sit in front.
     for (var i = 0; i < ordered.length; i++) {
       var k = ordered[i], cf = FRAMES[k[0]];
-      if (!cf || cf[9] || !sheetImage(cf[0]) || ((k[5] >= 0) !== !!front)) continue;
+      if (!cf || !cf[3] || !cf[4] || cf[9] || !sheetImage(cf[0]) || ((k[5] >= 0) !== !!front)) continue;
       if (k[6] && window.enablePortalGuide === false) continue;
       if (k[7] && window.enableOrbGuide === false) continue;
       var sx = SPRITE_UNIT * kx, sy = SPRITE_UNIT * ky;
@@ -1178,7 +1272,7 @@
         var derived = childName.replace('_001.png', '_glow_001.png');
         if (derived !== childName && FRAMES[derived]) glowName = derived;
       }
-      if (glowName && FRAMES[glowName] && !FRAMES[glowName][9] && sheetImage(FRAMES[glowName][0])) {
+      if (glowName && FRAMES[glowName] && FRAMES[glowName][3] && FRAMES[glowName][4] && !FRAMES[glowName][9] && sheetImage(FRAMES[glowName][0])) {
         var cgf = FRAMES[glowName];
         var cgp = framePlacement(cgf, kx, ky, SPRITE_UNIT);
         // reference _addGlowSprite: the child glow uses the child def's literal tint when it
@@ -1212,7 +1306,7 @@
     var kidList = typeof OBJ_CHILDREN !== 'undefined' ? OBJ_CHILDREN[o.id] : null;
     // reference v2.0: objects whose main frame is "none"/"emptyFrame" (or whose frame is not
     // in the atlas, e.g. the "noen" typo) render through their children only — no fallback box
-    if ((!name || !FRAMES[name]) && kidList && kidList.length) {
+    if ((!name || !FRAMES[name] || !FRAMES[name][3] || !FRAMES[name][4]) && kidList && kidList.length) {
       var fp0 = LevelModel.footprint(o);
       var ccx = x0 + fp0.w * CELL / 2, ccy = y1 - fp0.h * CELL / 2;
       var C0 = toS(ccx, ccy), O0 = toS(ccx + 1, ccy + 1);
@@ -1241,7 +1335,7 @@
       g.globalAlpha = ga0; g.globalCompositeOperation = gco0;
       return true;
     }
-    if (!name || !FRAMES[name]) return false;
+    if (!name || !FRAMES[name] || !FRAMES[name][3] || !FRAMES[name][4]) return false;
     var f = FRAMES[name];
     if (f[9] || !sheetImage(f[0])) return false;     // rotated atlas frames and unloaded sheets use the fallback
     var u = SPRITE_UNIT;
@@ -1326,7 +1420,7 @@
     // portals draw their back half first (Web Dashers: front frame + _back_ frame make the full oval)
     if (kind === 'portal' && name.indexOf('_front_') > 0) {
       var bname = name.replace('_front_', '_back_'), bf = FRAMES[bname];
-      if (bf && !bf[9] && sheetImage(bf[0])) {
+      if (bf && bf[3] && bf[4] && !bf[9] && sheetImage(bf[0])) {
         var bp = framePlacement(bf, kx, ky, u);
         var bdw = bp.w, bdh = bp.h;
         var bdx = bp.x - bdw / 2, bdy = bp.y - bdh / 2;
@@ -1343,7 +1437,7 @@
     // behind them at alpha 0.425, tinted like the object (black-default objects skip it)
     if (!glowOff && typeof GLOW_OF === 'object' && GLOW_OF[o.id]) {
       var gname = GLOW_OF[o.id], gf = FRAMES[gname];
-      if (gf && !gf[9] && sheetImage(gf[0])) {
+      if (gf && gf[3] && gf[4] && !gf[9] && sheetImage(gf[0])) {
         var gp = framePlacement(gf, kx, ky, u);
         var gdw = gp.w, gdh = gp.h;
         var gdx = gp.x - gdw / 2, gdy = gp.y - gdh / 2;
@@ -1369,12 +1463,12 @@
       g.restore();
     }
     // Web Dashers adds a separate _2 overlay to solid/hazard frames, using detail channel 2 by default.
-    if (overlayFrame && !overlayFrame[9] && sheetImage(overlayFrame[0])) {
+    if (overlayFrame && overlayFrame[3] && overlayFrame[4] && !overlayFrame[9] && sheetImage(overlayFrame[0])) {
       var op = framePlacement(overlayFrame, kx, ky, u);
       var odw = op.w, odh = op.h, odx = op.x - odw / 2, ody = op.y - odh / 2;
+      // an overlay is only ever drawn tinted: a raw overlay frame is white art, which showed up as pale boxes
       var osrc = overlayColor ? frameTint(overlayName, overlayFrame, overlayColor) : null;
       if (osrc) g.drawImage(osrc, 0, 0, overlayFrame[3], overlayFrame[4], odx, ody, odw, odh);
-      else g.drawImage(SHEET_IMGS[overlayFrame[0]], overlayFrame[1], overlayFrame[2], overlayFrame[3], overlayFrame[4], odx, ody, odw, odh);
     }
     if (kidList && !MONO) drawChildParts(g, kidList, kx, ky, col, o, true, pulseTint, !glowOff && typeof GLOW_OF === 'object' && GLOW_OF[o.id]);
     // tint-0 child frames are already represented by OBJ_CHILDREN in current Web Dashers data;
@@ -1393,7 +1487,7 @@
       }
       for (var kk = 0; kk < legacyKids.length; kk++) {
         var kf = FRAMES[legacyKids[kk]];
-        if (!kf || kf[9] || !sheetImage(kf[0])) continue;
+        if (!kf || !kf[3] || !kf[4] || kf[9] || !sheetImage(kf[0])) continue;
         var kp = framePlacement(kf, kx, ky, u);
         var kdw = kp.w, kdh = kp.h;
         var kdx = kp.x - kdw / 2, kdy = kp.y - kdh / 2;
@@ -1481,14 +1575,6 @@
       if (inf && inf.rotation && inf.centerGroup > 0 && inf.pivot) {
         var ocx = x0 + fp.w * CELL / 2, ocy = y0 + fp.h * CELL / 2;
         var pivotX = inf.pivot.x, pivotY = inf.pivot.y;
-        var pivotState = groupState[inf.centerGroup];
-        if (pivotState) {
-          pivotX += pivotState.bx; pivotY += pivotState.by;
-          for (var pti = 0; pti < pivotState.tweens.length; pti++) {
-            var ptw = pivotState.tweens[pti], ptf = easingSample(ptw.easingType, ptw.easingRate, Math.min(1, ptw.t / ptw.dur));
-            pivotX += ptw.dx * ptf; pivotY += ptw.dy * ptf;
-          }
-        }
         var odx = ocx - pivotX, ody = ocy - pivotY;
         var orc = Math.cos(inf.rotation), ors = -Math.sin(inf.rotation); // world y-up; positive GD rotation is clockwise on screen
         var ncx = pivotX + odx * orc - ody * ors, ncy = pivotY + odx * ors + ody * orc;
@@ -1509,6 +1595,7 @@
       var a = toS(x0, y1), b = toS(x1, y0);
       if (b.x < -60 || a.x > CW + 60 || b.y < -60 || a.y > CH + 60) continue;
       var w = b.x - a.x, h = b.y - a.y;
+      if (BEAST_KEYS[o.id]) { drawBeast(g, toS, o, x0, y1); g.globalAlpha = 1; continue; }
       if (kind === 'text') { drawTextObj(g, toS, o, rotationExtra, pulseTint); g.globalAlpha = 1; continue; }
       if (kind === 'decor') {
         if (!drawSpriteObj(g, toS, o, x0, y1, 1, rotationExtra, pulseTint)) drawDecor(g, toS, o, x0, y0, rotationExtra, pulseTint);
@@ -1540,10 +1627,9 @@
         g.beginPath(); g.moveTo(base.x, base.y); g.lineTo(apex.x, apex.y); g.lineTo(tip.x, tip.y);
         g.closePath(); g.fill();
       } else if (kind === 'slope') {
-        if (LevelModel.DECO_SLOPE && LevelModel.DECO_SLOPE[o.id]) {
-          // decoration slope: reference renders the sprite only (no collider)
-          if (drawSpriteObj(g, toS, o, x0, y1, 1, rotationExtra, pulseTint)) continue;
-        }
+        // reference: every slope object is its sprite (decoration or physical); the black wedge is only
+        // the fallback when no sprite is available
+        if (drawSpriteObj(g, toS, o, x0, y1, 1, rotationExtra, pulseTint)) continue;
         var cs = slopeCorners(o, x0, x1, y0, y1).map(function (c) { return toS(c[0], c[1]); });
         g.fillStyle = '#000';
         g.beginPath(); g.moveTo(cs[0].x, cs[0].y); g.lineTo(cs[1].x, cs[1].y); g.lineTo(cs[2].x, cs[2].y);
@@ -1666,6 +1752,10 @@
   // Render-order cache and two spatial indexes. Static objects only need a small
   // viewport-sized query; grouped objects retain the original wide query window
   // because move/rotate triggers can bring distant objects into view.
+  // Web Dashers default layer / order per object (levelObj.zLayer || default_z_layer); the level's own
+  // keys 24 / 25 override them. Table: data/zdefaults.js (OBJ_ZDEFAULTS).
+  function defZLayer(id) { var d = typeof OBJ_ZDEFAULTS !== 'undefined' ? OBJ_ZDEFAULTS[id] : null; return d ? d[0] : 0; }
+  function defZOrder(id) { var d = typeof OBJ_ZDEFAULTS !== 'undefined' ? OBJ_ZDEFAULTS[id] : null; return d ? d[1] : 0; }
   var RENDER_LAYER_DEPTH = { '-5': -12, '-3': -9, '-1': -6, '0': 0, '1': 3, '3': 6, '5': 9, '7': 10.5, '9': 12, '11': 13.5 };
   function objectRenderDepth(o) {
     var isText = LevelModel.kindOf(o.id) === 'text';
@@ -1745,13 +1835,164 @@
     if (!f || f[9] || !sheetImage(f[0])) return false;
     // the icons atlas is 1x: one atlas pixel = one world unit (the cube frame is 60px = the
     // 30-unit hitbox box drawn at the 2px/unit play scale) — unlike the hd level sheets (0.5)
-    var dw = f[3] * k, dh = f[4] * k;
+    var fsc = f[10] || 1;
+    var dw = f[3] * fsc * k, dh = f[4] * fsc * k;
     var dx = (f[5] - f[7] / 2) * k, dy = (f[6] - f[8] / 2) * k + (oy || 0);
     var tc = tint ? frameTint(name, f, tint) : null;
     if (tc) g.drawImage(tc, 0, 0, f[3], f[4], dx, dy, dw, dh);
     else g.drawImage(sheetImage(f[0]), f[1], f[2], f[3], f[4], dx, dy, dw, dh);
     return true;
   }
+  // ---- robot / spider skeletons (port of Web Dashers player.js _applyRobotFrame / _applySpiderFrame) ----
+  // Each pose sprite is a body part: base frame tinted main, _2 overlay tinted secondary, _extra_ untinted
+  // (the eyes). Parts are placed from the descriptor position with the per-tag offsets Web Dashers uses.
+  var SKEL_LAYERS = [];
+  function skelVariant(tex, v) {
+    if (v === 'overlay') return tex.replace(/_001\.png$/, '_2_001.png');
+    if (v === 'extra') return tex.replace(/_001\.png$/, '_extra_001.png');
+    return tex;
+  }
+  function skelFrameKey(name, pl) {
+    var d = SKELETON_DATA[name], G = d.groups;
+    var tm = ANIM_MS / 1000;
+    var goingUp = pl.flip ? pl.vy < 0 : pl.vy > 0;
+    function pick(list, fps) { return list[Math.floor(tm * fps) % list.length]; }
+    function startThenLoop(start, loop, fps) {
+      if (!start || !start.length) return loop ? pick(loop, fps) : null;
+      var startDur = start.length / fps;
+      if (tm < startDur || !loop || !loop.length) return start[Math.min(start.length - 1, Math.floor(tm * fps))];
+      return loop[Math.floor((tm - startDur) * fps) % loop.length];
+    }
+    if (name === 'robot') {
+      if (pl.dashing && G.fallLoop) return pick(G.fallLoop, 16);
+      if (pl.onGround) return G.run ? pick(G.run, 16) : (G.idle1 ? pick(G.idle1, 16) : (G.idle ? pick(G.idle, 16) : null));
+      return goingUp ? startThenLoop(G.jumpStart, G.jumpLoop, 15) : startThenLoop(G.fallStart, G.fallLoop, 15);
+    }
+    if (!pl.onGround) return G.fall ? pick(G.fall, 12) : null;
+    if (G.run) return pick(G.run, 16);
+    if (G.walk) return pick(G.walk, 16);
+    return G.idle ? pick(G.idle, 16) : null;
+  }
+  function drawSkeleton(g, name, pl, k, main, sec) {
+    var d = SKELETON_DATA[name];
+    if (!d) return false;
+    var key = skelFrameKey(name, pl);
+    var sprites = key ? d.frames[key] : null;
+    if (!sprites) return false;
+    var isRobot = name === 'robot';
+    SKEL_LAYERS.length = 0;
+    for (var i = 0; i < sprites.length; i++) {
+      var sp = sprites[i], tag = sp[0], tex = sp[1];
+      var isLeg = isRobot ? (tag === 0 || tag === 2 || tag === 4 || tag === 6) : (tag === 0 || tag === 1 || tag === 4 || tag === 5);
+      var isArm = isRobot && (tag === 1 || tag === 5);
+      var yOff = tag === 3 ? 5 : (isArm ? -1 : (isLeg ? -9 : 0));
+      var xs = (isLeg || isArm) ? 1.8 : 1;
+      var z = sp[9] || tag;
+      // Web Dashers y is up (positionYSign -1); the canvas flips for gravity in drawPlayer
+      var layers = [['overlay', -0.02, sec], ['base', 0, main], ['extra', 0.08, null]];
+      for (var li = 0; li < layers.length; li++) {
+        SKEL_LAYERS.push({ depth: 8 + z * 0.1 + layers[li][1], order: SKEL_LAYERS.length, tex: skelVariant(tex, layers[li][0]),
+          px: sp[2] * xs, py: -(sp[3] + yOff), sx: sp[4], sy: sp[5], rot: sp[6] * Math.PI / 180, fx: sp[7], fy: sp[8], tint: layers[li][2] });
+      }
+    }
+    SKEL_LAYERS.sort(function (a, b) { return a.depth - b.depth || a.order - b.order; });
+    var drew = false;
+    for (var j = 0; j < SKEL_LAYERS.length; j++) {
+      var L = SKEL_LAYERS[j], f = FRAMES[L.tex];
+      if (!f || f[9] || !f[3] || !f[4] || !sheetImage(f[0])) continue;
+      g.save();
+      g.translate(L.px * k, L.py * k);
+      if (L.rot) g.rotate(L.rot);
+      g.scale(L.sx * (L.fx ? -1 : 1), L.sy * (L.fy ? -1 : 1));
+      var fsc2 = f[10] || 1;
+      var dw = f[3] * fsc2 * k, dh = f[4] * fsc2 * k, dx = (f[5] - f[7] / 2) * k, dy = (f[6] - f[8] / 2) * k;
+      var tc = L.tint ? frameTint(L.tex, f, L.tint) : null;
+      if (tc) g.drawImage(tc, 0, 0, f[3], f[4], dx, dy, dw, dh);
+      else g.drawImage(sheetImage(f[0]), f[1], f[2], f[3], f[4], dx, dy, dw, dh);
+      g.restore();
+      drew = true;
+    }
+    return drew;
+  }
+
+  // ---- beasts (Web Dashers animations.js BeastAnim): animated monster hazards ----
+  // Each beast is a skeleton of parts (SKELETON_DATA.beastNN) drawn in its object space. The eye
+  // (GJBeast01_03) has no pose of its own: it is drawn at its parent part's transform each frame.
+  var BEAST_KEYS = { 918: 'beast01', 1327: 'beast02', 1328: 'beast03', 1584: 'beast04', 2012: 'beast05' };
+  var BEAST_DETAIL_TAGS = { 1327: [0], 1328: [0], 1584: [0], 2012: [1, 2] };
+  var BEAST_EYE = { 918: { frame: 'GJBeast01_03_001.png', parent: 'GJBeast01_01_001.png' } };
+  var BEAST_LAYERS = [];
+  // the idle cycle: the default animation first, then the others, each playing once (looped ones repeat)
+  function beastFrameKey(o, d) {
+    var t = ANIM_MS / 1000 + ((Math.abs(o.gx) * 37 + Math.abs(o.gy) * 91) % 101) * 0.037;   // per-object phase
+    var def = d.groups[d.default];
+    if (def && def.looped) return def.keys[Math.floor(t / def.delay) % def.frames];
+    var names = [d.default], k;
+    for (k in d.groups) if (k !== d.default) names.push(k);
+    var period = 0;
+    for (k = 0; k < names.length; k++) { var gg = d.groups[names[k]]; if (gg) period += gg.frames * gg.delay; }
+    if (!(period > 0)) return null;
+    var local = t % period;
+    for (k = 0; k < names.length; k++) {
+      var g2 = d.groups[names[k]]; if (!g2) continue;
+      var span = g2.frames * g2.delay;
+      if (local < span) return g2.keys[Math.min(g2.frames - 1, Math.floor(local / g2.delay))];
+      local -= span;
+    }
+    return null;
+  }
+  function drawBeast(g, toS, o, x0, y1) {
+    var d = SKELETON_DATA[BEAST_KEYS[o.id]];
+    if (!d) return false;
+    var key = beastFrameKey(o, d);
+    var sprites = key ? d.frames[key] : null;
+    if (!sprites) return false;
+    var fp = LevelModel.footprint(o);
+    var ccx = x0 + fp.w * CELL / 2, ccy = y1 - fp.h * CELL / 2;
+    var C = toS(ccx, ccy), O = toS(ccx + 1, ccy + 1);
+    var kx = Math.abs(O.x - C.x), ky = Math.abs(O.y - C.y);
+    var kids = OBJ_CHILDREN[o.id] || [];
+    var detailTags = BEAST_DETAIL_TAGS[o.id] || [];
+    var eye = BEAST_EYE[o.id];
+    var mainCol = chanColor(o), detailCol = channelColor(o.col2 > 0 ? o.col2 : 1011);
+    BEAST_LAYERS.length = 0;
+    for (var i = 0; i < sprites.length; i++) {
+      var sp = sprites[i], tex = sp[1];
+      var kidTint;
+      for (var ki = 0; ki < kids.length; ki++) if (kids[ki][0] === tex) { kidTint = kids[ki][3]; break; }
+      var detail = detailTags.indexOf(sp[0]) >= 0;
+      var tint = (kidTint === 0 && !detail) ? '#000000' : (detail ? detailCol : mainCol);
+      BEAST_LAYERS.push({ tex: tex, px: sp[2], py: -sp[3], sx: sp[4], sy: sp[5], rot: sp[6] * Math.PI / 180, fx: sp[7], fy: sp[8], z: sp[9], tint: tint, parent: tex });
+    }
+    BEAST_LAYERS.sort(function (a, b) { return a.z - b.z; });
+    function layer(L, tex, tint) {
+      var f = FRAMES[tex];
+      if (!f || !f[3] || !f[4] || f[9] || !sheetImage(f[0])) return;
+      g.save();
+      g.translate(L.px * kx, L.py * ky);
+      if (L.rot) g.rotate(L.rot);
+      g.scale(L.sx * (L.fx ? -1 : 1), L.sy * (L.fy ? -1 : 1));
+      var pl = framePlacement(f, kx, ky, SPRITE_UNIT);
+      var dx = pl.x - pl.w / 2, dy = pl.y - pl.h / 2;
+      var tc = tint ? frameTint(tex, f, tint) : null;
+      if (tc) g.drawImage(tc, 0, 0, f[3], f[4], dx, dy, pl.w, pl.h);
+      else g.drawImage(sheetImage(f[0]), f[1], f[2], f[3], f[4], dx, dy, pl.w, pl.h);
+      g.restore();
+    }
+    g.save();
+    g.translate(C.x, C.y);
+    if (o.rot) g.rotate(o.rot * Math.PI / 180);
+    if (o.flipX) g.scale(-1, 1);
+    if (o.flipY) g.scale(1, -1);
+    for (var j = 0; j < BEAST_LAYERS.length; j++) {
+      var L = BEAST_LAYERS[j];
+      layer(L, L.tex, L.tint);
+      if (eye && L.tex === eye.parent) layer(L, eye.frame, null);   // eye rides its parent part
+    }
+    g.restore();
+    return true;
+  }
+
   function drawPlayer(g, toS, s, pl, invert) {
     var c = toS(pl.x, pl.y);
     var h = pl.half * s;
@@ -1809,6 +2050,15 @@
         }
         g.restore();
         return;
+      }
+      if (pl.mode === 'robot' || pl.mode === 'spider') {
+        // skeleton pose: its own save so a missing pose falls through to the normal icon untouched
+        g.save();
+        if (pl.flip) g.scale(1, -1);
+        if (pl.mirrored) g.scale(-1, 1);
+        var drewSkel = drawSkeleton(g, pl.mode, pl, k, main, sec);
+        g.restore();
+        if (drewSkel) { g.restore(); return; }
       }
       // reference syncSprites: rotation negates while mirrored
       g.rotate((pl.mode === 'cube' || pl.mode === 'ball' || pl.mode === 'wave' || pl.mode === 'swing' ? pl.rot : 0) * (pl.mirrored ? -1 : 1));
@@ -2194,6 +2444,7 @@
   }
 
   function renderEdit() {
+    if (!ectx) return;
     // real level background first (the reference editor shows the same texture; white sheet
     // sprites would vanish on a plain white canvas)
     var bgDrawn = false;
@@ -2290,8 +2541,27 @@
   }
 
   // ================= tabs =================
+  // the editor only holds its bitmap while its tab is open: a 1138x640 backing store plus the
+  // sprite canvases it draws are released on leaving the tab, so playing never keeps them alive
+  var EDITOR_W = 1138, EDITOR_H = 640;
+  function setEditorBitmap(on) {
+    var ed = document.getElementById('editor');
+    if (!ed) return;
+    if (on) {
+      if (ed.width !== EDITOR_W) ed.width = EDITOR_W;
+      if (ed.height !== EDITOR_H) ed.height = EDITOR_H;
+      ectx = ed.getContext('2d');
+    } else {
+      ed.width = 0; ed.height = 0;
+      ectx = null;
+      clearCanvasCache();
+    }
+  }
   function setTab(name) {
+    var wasEdit = activeTab === 'edit';
     activeTab = name;
+    if (name === 'edit' && !wasEdit) setEditorBitmap(true);
+    if (wasEdit && name !== 'edit') setEditorBitmap(false);
     document.getElementById('view-play').style.display = name === 'play' ? 'block' : 'none';
     document.getElementById('view-levels').style.display = name === 'levels' ? 'block' : 'none';
     document.getElementById('view-edit').style.display = name === 'edit' ? 'block' : 'none';
@@ -2378,7 +2648,10 @@
 
   function init() {
     ctx = document.getElementById('game').getContext('2d');
-    ectx = document.getElementById('editor').getContext('2d');
+    // the editor's bitmap is allocated only when its tab opens (setEditorBitmap)
+    var edInit = document.getElementById('editor');
+    if (edInit) { edInit.width = 0; edInit.height = 0; }
+    ectx = null;
     io = document.getElementById('io');
 
     var game = document.getElementById('game');
@@ -2427,6 +2700,17 @@
     click('btn-reset', function () { loadLevel(levelIdx); flash('Restored ' + LEVELS[levelIdx].name + '.'); });
     click('set-noclip', function () { showNoclip = !showNoclip; syncSettings(); });
     click('set-hitboxes', function () { showHitboxes = !showHitboxes; syncSettings(); });
+    click('set-clear-assets', function () { clearAssetCaches(); syncSettings(); });
+    // graphics tier: switching reloads the page, because the atlas table is read at startup
+    var qb = document.getElementById('set-quality');
+    if (qb) {
+      qb.textContent = 'GRAPHICS: ' + (window.RR_TIER === 'hd' ? 'HIGH' : 'LOW');
+      qb.onclick = function () {
+        var next = window.RR_TIER === 'hd' ? 'sd' : 'hd';
+        try { localStorage.setItem('rr_tier', next); } catch (e) { flash('Graphics setting could not be saved.'); return; }
+        location.reload();
+      };
+    }
     click('set-percent', function () { showPercent = !showPercent; syncSettings(); });
     syncSettings();
 
@@ -2451,7 +2735,7 @@
 
     // test hook for the headless harness
     window.RRDebug = {
-      advanceFrame: advanceFrame, startDemo: startDemo, resetRun: resetRun,
+      advanceFrame: advanceFrame, startDemo: startDemo, resetRun: resetRun, clearAssets: clearAssetCaches,
       startPlay: function () { resetRun(); status = 'ready'; }, pressJump: pressJump, releaseJump: releaseJump,
       getStatus: function () { return status; }, getPlayer: function () { return p; }, getPlayer2: function () { return p2; },
       groupInfo: function (g) { return groupInfo([g]); }, getGroupState: function () { return groupState; },
@@ -2469,17 +2753,24 @@
       // test hook: park the simulation and look at any spot of the level. Triggers are
       // fast-forwarded to the parked x so colour / move states match a real run there.
       freezeAt: function (x, y, flip) {
+        // Rebuild trigger state by walking from the beginning. The previous helper set
+        // p.x to the requested destination before entering this loop, so its p.x >= x
+        // guard exited immediately and never replayed move/rotate/toggle/spawn triggers.
         frozen = true; status = 'play'; holding = false; pressQueued = false;
         restorePalette();                       // colour triggers must replay from the header palette
-        if (p) { p.x = x; p.y = y; p.vy = 0; p.rot = 0; p.flip = !!flip; p.mode = p.mode || 'cube'; p.dead = false; p2 = null; }
+        if (p) { p.x = 0; p.y = y; p.vy = 0; p.rot = 0; p.flip = !!flip; p.mode = 'cube'; p.dead = false; p2 = null; }
         startTriggers();
         if (p) {
           var guard = 0;
           while (guard++ < 20000) {
+            frameNo++;
             processTriggers(); processColourTriggers(); tickTweens();
             if (!p || p.dead || p.x >= x) break;
-            p.x = Math.min(x, p.x + 10);
+            p.x = Math.min(x, p.x + p.speed * 0.9);
           }
+          if (p) p.x = x;
+          GameSim.refreshDyn(LEVEL.sim(), groupInfo);
+          lastDynLevel = LEVEL.sim(); dynDirty = false;
         }
         // parked-camera hook: sync the camera-delta accumulators so the background phase matches
         // a real run that travelled to this x (no mirror assumed while parking)

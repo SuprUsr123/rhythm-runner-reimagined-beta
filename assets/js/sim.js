@@ -100,12 +100,53 @@ var GameSim = (function () {
     lv.g = g;
     return g;
   }
-  // Grouped objects are re-placed every frame: info(groups) gives the summed offset and visibility.
-  function wrap(b, dx, dy) {
+  // Grouped objects are re-placed every frame. Translation first (group offset), then the
+  // centre-group orbit (rigid move of the whole object about the pivot), like the renderer.
+  // Plain solids and slopes are axis-aligned rectangles / lines in the narrow phase, so they
+  // are only ever moved rigidly: their shape is never changed by a group rotation (a rotated
+  // rectangle has no exact axis-aligned form, and the old envelope wrongly grew platforms,
+  // sealed corridors and dropped ground). Centred shapes (spikes, portals, orbs) keep their
+  // oriented test and get a conservative envelope for broad-phase only.
+  function orbitCentre(cx, cy, inf) {
+    var ox = cx - inf.pivot.x, oy = cy - inf.pivot.y;
+    var c = Math.cos(inf.rotation), sn = Math.sin(inf.rotation);
+    return { x: inf.pivot.x + ox * c + oy * sn, y: inf.pivot.y - ox * sn + oy * c };
+  }
+  function wrap(b, inf) {
     var w = {}, k;
     for (k in b) w[k] = b[k];
-    if (w.x0 !== undefined) { w.x0 += dx; w.x1 += dx; w.y0 += dy; w.y1 += dy; }
-    if (w.cx !== undefined) { w.cx += dx; w.cy += dy; }
+    var dx = inf.dx || 0, dy = inf.dy || 0;
+    var angle = inf.rotation || 0;
+    var pivotOn = !!(angle && inf.centerGroup > 0 && inf.pivot);
+    var rectOnly = w.x0 !== undefined && w.x1 !== undefined && w.y0 !== undefined && w.y1 !== undefined &&
+      w.cx === undefined && w.w === undefined;
+    if (rectOnly) {
+      var ocx = (b.x0 + b.x1) / 2, ocy = (b.y0 + b.y1) / 2;
+      var ncx = ocx + dx, ncy = ocy + dy;
+      if (pivotOn) { var oc = orbitCentre(ncx, ncy, inf); ncx = oc.x; ncy = oc.y; }
+      var ddx = ncx - ocx, ddy = ncy - ocy;
+      w.x0 = b.x0 + ddx; w.x1 = b.x1 + ddx; w.y0 = b.y0 + ddy; w.y1 = b.y1 + ddy;
+    } else {
+      var rect = w.x0 !== undefined && w.x1 !== undefined && w.y0 !== undefined && w.y1 !== undefined;
+      var rw, rh, cx, cy;
+      if (rect) { rw = w.x1 - w.x0; rh = w.y1 - w.y0; }
+      if (w.cx !== undefined && w.cy !== undefined) { cx = w.cx + dx; cy = w.cy + dy; }
+      else if (rect) { cx = (w.x0 + w.x1) / 2 + dx; cy = (w.y0 + w.y1) / 2 + dy; }
+      if (cx !== undefined && pivotOn) { var o2 = orbitCentre(cx, cy, inf); cx = o2.x; cy = o2.y; }
+      // local orientation (hazards, portals, direction-sensitive orbs) turns with the group unless locked
+      var localRotation = angle && (!inf.centerGroup || (inf.pivot && !inf.lockRotation)) ? angle : 0;
+      if (w.rot !== undefined && localRotation) w.rot += localRotation * 180 / Math.PI;
+      if (cx !== undefined) {
+        w.cx = cx; w.cy = cy;
+        if (rect || (w.w !== undefined && w.h !== undefined)) {
+          var baseW = w.w !== undefined ? w.w : rw, baseH = w.h !== undefined ? w.h : rh;
+          var a = w.rot !== undefined ? w.rot * Math.PI / 180 : localRotation;
+          var ca = Math.abs(Math.cos(a)), sa = Math.abs(Math.sin(a));
+          var ex = (baseW * ca + baseH * sa) / 2, ey = (baseW * sa + baseH * ca) / 2;
+          w.x0 = cx - ex; w.x1 = cx + ex; w.y0 = cy - ey; w.y1 = cy + ey;
+        }
+      }
+    }
     if (w.target !== undefined) w.target += dy;
     w._s = 0;
     return w;
@@ -116,9 +157,10 @@ var GameSim = (function () {
     for (k = 0; k < keys.length; k++) {
       var src = base[keys[k]] || [], arr = [];
       for (i = 0; i < src.length; i++) {
-        var b = src[i], inf = info(b.groups || []);
-        b._aff = !!(inf.hidden || inf.dx !== 0 || inf.dy !== 0);
-        if (b._aff && !inf.hidden) arr.push(wrap(b, inf.dx, inf.dy));
+        var b = src[i], inf = info(b.groups || []) || {};
+        var changed = !!(inf.hidden || inf.dx || inf.dy || inf.rotation);
+        b._aff = changed;
+        if (changed && !inf.hidden) arr.push(wrap(b, inf));
       }
       dyn[keys[k]] = arr;
     }
@@ -501,14 +543,14 @@ var GameSim = (function () {
       if (id === 36) vel = 8;
       else if (id === 141) vel = yS * 0.37;
       else if (id === 1333) vel = yS;
-      else if (id === 84) { vel = yS * 0.4; flipAfter = true; }
+      else if (id === 84) { vel = yS * 0.8 * mini; flipAfter = true; }   // reference generic branch: gravity ring base 0.8
       else if (id === 1022) { vel = -yS * 0.7; flipAfter = true; }
       else if (id === 1330) vel = -14;
     } else if (isUfo) {
       if (id === 36) vel = (p.isMini ? 17.888 : 22.36) / 2;
       else if (id === 141) vel = (p.isMini ? 7.674 : 9.592) / 2;
       else if (id === 1333) vel = yS * 1.02;
-      else if (id === 84) { vel = (p.isMini ? -7.155 : -8.944); flipAfter = true; }
+      else if (id === 84) { vel = -yS * 0.8 * mini; flipAfter = true; }
       else if (id === 1022) { vel = -(p.isMini ? 17.888 : 22.36); flipAfter = true; }
       else if (id === 1330) vel = -11.2;
     } else if (isBall || isSpider) {
@@ -516,14 +558,14 @@ var GameSim = (function () {
       if (id === 36) vel = ballBase;
       else if (id === 141) vel = ballBase * 0.77;
       else if (id === 1333) vel = ballBase * 1.34;
-      else if (id === 84) { vel = ballBase * 0.4; flipAfter = true; }
+      else if (id === 84) { vel = ballBase * 0.8; flipAfter = true; }   // reference: 0.8 base, x0.7 for ball/spider (in ballBase)
       else if (id === 1022) { vel = ballBase * -1.94; flipAfter = true; }
       else if (id === 1330) vel = -15;
     } else if (isRobot) {
       if (id === 36) vel = yS * 0.9;
       else if (id === 141) vel = yS * 0.72;
       else if (id === 1333) vel = yS * 1.28;
-      else if (id === 84) { vel = yS * 0.4; flipAfter = true; }
+      else if (id === 84) { vel = yS * 0.8 * mini; flipAfter = true; }
       else if (id === 1022) { vel = yS * -1.94; flipAfter = true; }
       else if (id === 1330) vel = -15;
     } else {
@@ -531,7 +573,7 @@ var GameSim = (function () {
       if (id === 36) vel = cubeBase;
       else if (id === 141) vel = cubeBase * 0.72;
       else if (id === 1333) vel = cubeBase * 1.38;
-      else if (id === 84) { vel = cubeBase; flipAfter = true; }
+      else if (id === 84) { vel = cubeBase * 0.8; flipAfter = true; }   // reference: gravity ring base 0.8 (was 1.0, too strong)
       else if (id === 1022) { vel = cubeBase; flipBefore = true; }
       else if (id === 1330) vel = -9;
     }
