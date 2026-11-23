@@ -160,3 +160,7 @@ textarea {
   #view-edit > .row:first-of-type { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .title-meta { font-size: 9px; }
 }
+
+#platformer-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-top: 8px; }
+#platformer-controls button { min-height: 54px; width: 100%; border-width: 2px; touch-action: none; font-weight: bold; }
+#btn-platformer[aria-pressed="true"] { background: #000; color: #fff; }

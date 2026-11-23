@@ -20,8 +20,13 @@
   <div id="view-play">
     <canvas id="game" width="1138" height="640"></canvas>
     <button id="hold" type="button">HOLD TO JUMP / FLY</button>
+    <div id="platformer-controls" class="row" style="display:none" aria-label="Platformer movement">
+      <button id="move-left" type="button">◀ LEFT</button>
+      <button id="move-right" type="button">RIGHT ▶</button>
+    </div>
     <div class="row">
       <button id="btn-play" type="button">RESTART</button>
+      <button id="btn-platformer" type="button" aria-pressed="false">PLATFORMER: OFF</button>
       <button id="btn-demo" type="button">DEMO RUN</button>
       <button id="btn-level" type="button">NEXT LEVEL</button>
       <button id="btn-zoom-out" type="button">ZOOM -</button>
@@ -34,7 +39,7 @@
       <button id="set-quality" type="button">GRAPHICS: LOW</button>
       <button id="set-percent" type="button" aria-pressed="true">PERCENT: ON</button>
     </div>
-    <p class="note">Desktop: Space jumps or flies. Speed portals change the run speed, pads and orbs launch you, slopes are walkable. Noclip ignores hazards and deadly sides. Hitboxes outline the player (thick box is the outer hitbox, small box is the inner one), solids (solid line) and hazards (dashed line).</p>
+    <p class="note">Desktop: Space jumps or flies. In Platformer Mode, use A/D or the arrow keys to move, and Space to jump. Touch users can use the on-screen direction buttons. Noclip ignores hazards and deadly sides. Hitboxes outline the player (thick box is the outer hitbox, small box is the inner one), solids (solid line) and hazards (dashed line).</p>
   </div>
 
   <div id="view-levels" style="display:none">
@@ -80,18 +85,24 @@
     (function () {
       var t = 'sd';
       try { t = localStorage.getItem('rr_tier') || 'sd'; } catch (e) { t = 'sd'; }
-      if (t !== 'hd' && t !== 'sd') t = 'sd';
+      if (t !== 'hd' && t !== 'sd' && t !== 'none') t = 'sd';
       window.RR_TIER = t;
-      document.write('<script src="assets/js/data/frames-' + t + '.js?v=1"><\/script>');
+      if (t === 'none') {
+        // no assets at all: an empty frame table, so every object and player uses its shape fallback
+        window.FRAMES = {};
+        window.SPRITE_SHEETS = [];
+      } else {
+        document.write('<script src="assets/js/data/frames-' + t + '.js?v=1"><\/script>');
+      }
     })();
   </script>
 <script src="assets/js/data/glow.js?v=1"></script>
 <script src="assets/js/data/skeletons.js?v=1"></script>
 <script src="assets/js/data/zdefaults.js?v=1"></script>
-<script src="assets/js/sim.js?v=8"></script>
-<script src="assets/js/level-model.js?v=14"></script>
+<script src="assets/js/sim.js?v=11"></script>
+<script src="assets/js/level-model.js?v=17"></script>
 <script src="assets/js/data/levels.js?v=4"></script>
 <script src="assets/js/data/decor.js?v=3"></script>
-<script src="assets/js/game.js?v=44"></script>
+<script src="assets/js/game.js?v=47"></script>
 </body>
 </html>

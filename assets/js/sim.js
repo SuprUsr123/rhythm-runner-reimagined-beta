@@ -1,5 +1,5 @@
 // Rhythm Runner physics v5. Units: GD 1x (cell = 30). Frame = 1/60 s, 4 substeps per frame.
-// Ported from web-dashers (player.js, level.js, game-scene.js). Triggers are not ported.
+// Ported from web-dashers (player.js, level.js, game-scene.js). Canvas-friendly 2.2 gameplay triggers are applied by game.js.
 var GameSim = (function () {
   // debug noclip: hazards / deadly solid sides / deadly slopes stop killing (landings still work)
   var NOCLIP = false;
@@ -224,16 +224,17 @@ var GameSim = (function () {
   function newPlayer(x, y, mode) {
     var sc = speedConsts(SPEED.ONE);
     return {
-      x: x, y: y, lastY: y, lastX: x, vy: 0,
+      x: x, y: y, lastY: y, lastX: x, vx: 0, vy: 0,
       rot: 0, mode: mode, flip: false, mirrored: false,
-      speed: SPEED.ONE, grav: sc.grav, yStart: sc.yStart,
+      speed: SPEED.ONE, grav: sc.grav, gravityScale: 1, yStart: sc.yStart,
       onGround: false, canJump: true, isJumping: false, onSlope: false,
       rotActive: false, rotStart: 0, rotTotal: 0, rotTime: 0,
       gdAccel: false,
+      stopMoveUntilRelease: false, freeModeCamera: false,
       portalIdx: -1, portalSet: null, speedIdx: -1, padIdx: -1, orbIdx: -1, orbHoldUsed: false, orbUsed: null,
       portalFired: {}, tpIgnore: true,          // portals fire once per attempt; teleports ignored until clear (reference reset)
       ballOpp: false, ballNormal: 1, ballHitPad: false, tickN: 0, lastBluePad: -1e9,
-      dashing: false, dashVy: 0, pendingVelocity: null,
+      dashing: false, dashVy: 0, pendingVelocity: null, dirSign: 1,
       half: C.HALF, inner: C.INNER, isMini: false,
       robotAccel: 0, robotHold: false, robotHoldTimer: 0,
       onCeiling: false,
@@ -241,6 +242,7 @@ var GameSim = (function () {
     };
   }
 
+  function gravityStrength(p) { return p.grav * (p.gravityScale === undefined ? 1 : p.gravityScale); }
   function setSpeed(p, v) { var sc = speedConsts(v); p.speed = v; p.grav = sc.grav; p.yStart = sc.yStart; }
 
   // mini portals: shrink (101) / grow (99). Hitbox half 9 instead of 15.
@@ -293,11 +295,11 @@ var GameSim = (function () {
       return;
     }
     if (p.isJumping) {
-      p.vy = gdTrunc(p.vy - p.grav * dt * flip);
+      p.vy = gdTrunc(p.vy - gravityStrength(p) * dt * flip);
       if (falling(p)) { p.isJumping = false; p.onGround = false; }
     } else {
       if (falling(p)) p.canJump = false;
-      p.vy = gdTrunc(p.vy - p.grav * dt * flip);
+      p.vy = gdTrunc(p.vy - gravityStrength(p) * dt * flip);
       if (p.flip) p.vy = Math.min(p.vy, 15); else p.vy = Math.max(p.vy, -15);
       if (fallingPastThreshold(p) && !p.rotActive) startRotate(p, 1);
     }
@@ -308,7 +310,7 @@ var GameSim = (function () {
     var miniScale = p.isMini ? 1.176470588 : 1;
     var mult = hold ? -1 : (falling(p) ? 0.8 : 1.2);
     var factor = hold && falling(p) ? 0.5 : 0.4;
-    p.vy -= p.grav * dt * flip * mult * factor * miniScale;
+    p.vy -= gravityStrength(p) * dt * flip * mult * factor * miniScale;
     if (hold) p.onGround = false;
     if (!p.wasBoosted) {
       if (p.flip) {
@@ -327,7 +329,7 @@ var GameSim = (function () {
     var jump = mini ? 6.648 : 6.871;
     var upVel = p.vy * flip;
     var grav = upVel > 1.916398 ? (mini ? 0.634524 : 0.540121) : (mini ? 0.421624 : 0.359973);
-    p.vy -= p.grav * grav * dt * flip;
+    p.vy -= gravityStrength(p) * grav * dt * flip;
     if (pressed) {
       p.vy = jump * flip;
       p.onGround = false; p.canJump = false; p.isJumping = true;
@@ -357,7 +359,7 @@ var GameSim = (function () {
       return;
     }
     if (falling(p)) p.canJump = false;
-    p.vy = gdTrunc(p.vy - 0.6 * p.grav * dt * flip);
+    p.vy = gdTrunc(p.vy - 0.6 * gravityStrength(p) * dt * flip);
     if (p.flip) p.vy = Math.min(p.vy, 15); else p.vy = Math.max(p.vy, -15);
   }
 
@@ -365,7 +367,7 @@ var GameSim = (function () {
   function spiderFall(p, dt) {
     var flip = flipMod(p);
     if (falling(p)) p.canJump = false;
-    p.vy = gdTrunc(p.vy - 0.6 * p.grav * dt * flip * (p.isMini ? 1.4 : 1));
+    p.vy = gdTrunc(p.vy - 0.6 * gravityStrength(p) * dt * flip * (p.isMini ? 1.4 : 1));
     if (p.flip) p.vy = Math.min(p.vy, 15); else p.vy = Math.max(p.vy, -15);
     if (fallingPastThreshold(p)) p.onGround = false;
   }
@@ -376,9 +378,9 @@ var GameSim = (function () {
     var miniScale = p.isMini ? 1 / 1.2 : 1;
     var jumpInit = 5.125 * miniScale;
     var holdMax = 15.8;
-    var holdForce = p.grav * 0.2 * miniScale;
-    var gravityHold = p.grav * 0.15;
-    var gravityFall = p.grav * 0.81;
+    var holdForce = gravityStrength(p) * 0.2 * miniScale;
+    var gravityHold = gravityStrength(p) * 0.15;
+    var gravityFall = gravityStrength(p) * 0.81;
     var maxFall = 14;
     var maxRise = 15 * miniScale;
     if (pressed && p.canJump) {
@@ -414,7 +416,7 @@ var GameSim = (function () {
     var flip = flipMod(p);
     if (p.swingSkip) { p.swingSkip = false; return; }
     if (falling(p)) p.canJump = false;
-    p.vy = p.vy - 0.4 * p.grav * dt * flip;
+    p.vy = p.vy - 0.4 * gravityStrength(p) * dt * flip;
     if (p.isJumping) {
       if (falling(p)) { p.isJumping = false; p.onGround = false; }
     } else {
@@ -528,14 +530,14 @@ var GameSim = (function () {
       if (id === 1330) { p.vy = gdTrunc(-14); }
       else if (id === 141) { p.vy = gdTrunc(fm * sb * 0.72); }
       else if (id === 1333) { p.vy = gdTrunc(fm * sb * 1.38); }
-      else if (id === 84) { p.vy = gdTrunc(fm * sb * 0.4); flipGravity(p, !p.flip, 1.0); }
-      else if (id === 1022) { p.vy = gdTrunc(fm * (-yS * 0.7)); flipGravity(p, !p.flip, 1.0); }
+      else if (id === 84) { p.vy = gdTrunc(fm * sb * 0.4); flipGravity(p, !p.flip); }   // reference flipGravity default halves vy
+      else if (id === 1022) { p.vy = gdTrunc(fm * (-yS * 0.7)); flipGravity(p, !p.flip); }
       else { p.vy = gdTrunc(fm * sb); }
       p.onGround = false; p.canJump = false; p.isJumping = true;
       return;
     }
     if (p.mode === 'wave') {
-      if (id === 84 || id === 1022) flipGravity(p, !p.flip, 1.0);
+      if (id === 84 || id === 1022) flipGravity(p, !p.flip);   // reference default (0.5); wave overwrites vy each tick
       return;
     }
     var vel = 0, flipBefore = false, flipAfter = false;
@@ -543,14 +545,14 @@ var GameSim = (function () {
       if (id === 36) vel = 8;
       else if (id === 141) vel = yS * 0.37;
       else if (id === 1333) vel = yS;
-      else if (id === 84) { vel = yS * 0.8 * mini; flipAfter = true; }   // reference generic branch: gravity ring base 0.8
+      else if (id === 84) { vel = yS * 0.4; flipAfter = true; }          // reference flying: cubeJump*0.4, flip halves vy (default 0.5)
       else if (id === 1022) { vel = -yS * 0.7; flipAfter = true; }
       else if (id === 1330) vel = -14;
     } else if (isUfo) {
       if (id === 36) vel = (p.isMini ? 17.888 : 22.36) / 2;
       else if (id === 141) vel = (p.isMini ? 7.674 : 9.592) / 2;
       else if (id === 1333) vel = yS * 1.02;
-      else if (id === 84) { vel = -yS * 0.8 * mini; flipAfter = true; }
+      else if (id === 84) { vel = -(p.isMini ? 7.155 : 8.944); flipAfter = true; }   // reference ufo: (mini?-7.155:-8.944)*2 @2x, flip halves
       else if (id === 1022) { vel = -(p.isMini ? 17.888 : 22.36); flipAfter = true; }
       else if (id === 1330) vel = -11.2;
     } else if (isBall || isSpider) {
@@ -558,14 +560,14 @@ var GameSim = (function () {
       if (id === 36) vel = ballBase;
       else if (id === 141) vel = ballBase * 0.77;
       else if (id === 1333) vel = ballBase * 1.34;
-      else if (id === 84) { vel = ballBase * 0.8; flipAfter = true; }   // reference: 0.8 base, x0.7 for ball/spider (in ballBase)
+      else if (id === 84) { vel = ballBase * 0.4; flipAfter = true; }   // reference: base*0.4, flip halves vy (default 0.5)
       else if (id === 1022) { vel = ballBase * -1.94; flipAfter = true; }
       else if (id === 1330) vel = -15;
     } else if (isRobot) {
       if (id === 36) vel = yS * 0.9;
       else if (id === 141) vel = yS * 0.72;
       else if (id === 1333) vel = yS * 1.28;
-      else if (id === 84) { vel = yS * 0.8 * mini; flipAfter = true; }
+      else if (id === 84) { vel = yS * 0.4; flipAfter = true; }          // reference robot: cubeJump*0.4 (no mini), flip halves
       else if (id === 1022) { vel = yS * -1.94; flipAfter = true; }
       else if (id === 1330) vel = -15;
     } else {
@@ -573,13 +575,13 @@ var GameSim = (function () {
       if (id === 36) vel = cubeBase;
       else if (id === 141) vel = cubeBase * 0.72;
       else if (id === 1333) vel = cubeBase * 1.38;
-      else if (id === 84) { vel = cubeBase * 0.8; flipAfter = true; }   // reference: gravity ring base 0.8 (was 1.0, too strong)
+      else if (id === 84) { vel = cubeBase; flipAfter = true; }          // reference cube: full cubeOrbJump, the flip's default 0.5 halves it
       else if (id === 1022) { vel = cubeBase; flipBefore = true; }
       else if (id === 1330) vel = -9;
     }
     if (flipBefore) flipGravity(p, !p.flip, 1.0);
     p.vy = gdTrunc((flipBefore ? flipMod(p) : fm) * vel);
-    if (flipAfter) flipGravity(p, !p.flip, 1.0);
+    if (flipAfter) flipGravity(p, !p.flip);     // reference flipGravity default 0.5: blue/gravity orbs launch at half strength
     p.onGround = false; p.canJump = false; p.isJumping = true;
   }
 
@@ -696,6 +698,29 @@ var GameSim = (function () {
   function inBox(s, p, IN) { return p.y + IN > s.y0 && p.y - IN < s.y1; }
 
   // ---- collision ----
+  // Rotated solid (reference rotated Collider): the player is tested in the box's frame. Death uses the inner box;
+  // landing uses the face normal, pushed out along it. Returns 1 when the cube dies.
+  function collideRotSolid(p, s, flip, H, IN, out) {
+    var rad = s.rot * Math.PI / 180, c = Math.cos(rad), sn = Math.sin(rad);
+    var dx = p.x - s.cx, dy = p.y - s.cy;
+    var u = dx * c - dy * sn, v = dx * sn + dy * c;
+    var hw = s.w / 2, hh = s.h / 2;
+    var eu = hw + H, ev = hh + H;
+    if (Math.abs(u) >= eu || Math.abs(v) >= ev) return 0;
+    var pu = eu - Math.abs(u), pv = ev - Math.abs(v);
+    var nu = 0, nv = 0, pen;
+    if (pv < pu) { nv = v >= 0 ? 1 : -1; pen = pv; } else { nu = u >= 0 ? 1 : -1; pen = pu; }
+    var nx = nu * c + nv * sn, ny = -nu * sn + nv * c;
+    var landed = (flip > 0 && ny > 0.7 && p.vy <= 0) || (flip < 0 && ny < -0.7 && p.vy >= 0);
+    if (landed) {
+      p.x += nx * pen; p.y += ny * pen;
+      p.vy = 0; p.onGround = true; p.canJump = true; p.isJumping = false; p.rotActive = false;
+      if (p.mode === 'ball') { p.ballOpp = false; p.ballHitPad = false; p.ballNormal = (p.flip ? -1 : 1) * (p.mirrored ? -1 : 1); }
+      return 0;
+    }
+    if (!NOCLIP && Math.abs(u) < hw + IN && Math.abs(v) < hh + IN) { out.died = true; return 1; }
+    return 0;
+  }
   function collide(p, lv, out, input) {
     var flip = flipMod(p), H = p.half, IN = p.inner;
     var PH = p.mode === 'wave' ? (p.isMini ? 3 : 4.5) : H;
@@ -722,6 +747,9 @@ var GameSim = (function () {
 
     // Hazard tests use the full player-size hitbox; Wave has its smaller dedicated hitbox.
     // Solid-side penetration continues to use INNER below.
+    // Reference hazard test (player.js checkCollisions): the broad phase compares the player
+    // box against the ROTATED ENVELOPE (AABB of the rotated hazard box); circles use a
+    // centre-distance test with the same player size. There is no exact-OBB narrow phase.
     for (i = 0; i < aSpikes.length; i++) {
       var hz = aSpikes[i];
       if (hz.r !== undefined) {
@@ -729,7 +757,10 @@ var GameSim = (function () {
         var hmin = hz.r + PH;
         if (hdx * hdx + hdy * hdy <= hmin * hmin && !NOCLIP) { out.died = true; return; }
       } else if (hz.rot && (hz.cx !== undefined)) {
-        if (!NOCLIP && rotOverlap(hz.cx, hz.cy, hz.w, hz.h, hz.rot, p.x, p.y, PH)) { out.died = true; return; }
+        var hrad = hz.rot * Math.PI / 180, hc = Math.abs(Math.cos(hrad)), hs = Math.abs(Math.sin(hrad));
+        var ehx = hz.w / 2 * hc + hz.h / 2 * hs, ehy = hz.w / 2 * hs + hz.h / 2 * hc;
+        if (!NOCLIP && p.x + PH > hz.cx - ehx && p.x - PH < hz.cx + ehx &&
+            p.y + PH > hz.cy - ehy && p.y - PH < hz.cy + ehy) { out.died = true; return; }
       } else if (!NOCLIP && overlaps(p.x - PH, p.x + PH, p.y - PH, p.y + PH, hz)) { out.died = true; return; }
     }
 
@@ -912,12 +943,20 @@ var GameSim = (function () {
       if (s.ref && s.ref.broken) continue;
       if (!(R > s.x0 && L < s.x1)) continue;
       if (!(T > s.y0 && B < s.y1)) continue;
+      if (s.rotSolid) {
+        if (collideRotSolid(p, s, flip, H, IN, out) === 1) return;
+        B = p.y - H; T = p.y + H;
+        continue;
+      }
+      // reference landing window: the player must overlap the block by >5 world units (2x)
+      // on each covered edge, i.e. >2.5 here — a shallower corner clip is not a landing
+      var landX = p.x + H - 2.5 > s.x0 && p.x - H + 2.5 < s.x1;
       var landed = false;
       if (flip > 0) {
-        landed = p.vy <= 0 && p.lastY - H >= s.y1 - C.EPS && B < s.y1;
+        landed = landX && p.vy <= 0 && p.lastY - H >= s.y1 - C.EPS && B < s.y1;
         if (landed) p.y = s.y1 + H;
       } else {
-        landed = p.vy >= 0 && p.lastY + H <= s.y0 + C.EPS && T > s.y0;
+        landed = landX && p.vy >= 0 && p.lastY + H <= s.y0 + C.EPS && T > s.y0;
         if (landed) p.y = s.y0 - H;
       }
       if (landed) {
@@ -934,14 +973,38 @@ var GameSim = (function () {
           if (s.ref) out.breaks.push(s.ref);
           else { out.died = true; return; }
         }
-        // Ordinary solids stop a head hit. Breakables instead crumble and let the player
-        // pass through, matching their special collision behavior in Web Dashers.
+        // Reference: only flying modes snap to a ceiling/floor hit from the non-standing
+        // side; cube/ball/robot/spider pass through and die when the inner box overlaps.
         if (!s.ref) {
-          if (flip > 0 && p.vy > 0 && p.lastY + H <= s.y0 + C.EPS && T > s.y0) { p.y = s.y0 - H; p.vy = 0; }
-          else if (flip < 0 && p.vy < 0 && p.lastY - H >= s.y1 - C.EPS && B < s.y1) { p.y = s.y1 + H; p.vy = 0; }
+          var flySnap = p.mode === 'ship' || p.mode === 'ufo';
+          if (flip > 0 && p.vy > 0 && p.lastY + H <= s.y0 + C.EPS && T > s.y0) {
+            if (flySnap) { p.y = s.y0 - H; p.vy = 0; p.onCeiling = true; }
+          } else if (flip < 0 && p.vy < 0 && p.lastY - H >= s.y1 - C.EPS && B < s.y1) {
+            if (flySnap) { p.y = s.y1 + H; p.vy = 0; p.onGround = true; }
+          }
         }
       }
       B = p.y - H; T = p.y + H;
+    }
+  }
+
+  // Platformer-only horizontal collision. Classic mode remains on its original auto-run path.
+  var HORIZONTAL_SOLIDS = [];
+  function collideHorizontal(p, lv, out) {
+    var G = lv.g, D = lv.dyn || NO_DYN, H = p.half;
+    var a = clr(HORIZONTAL_SOLIDS);
+    gridInto(a, G.solids, p.x - H, p.x + H);
+    dynInto(a, D.solids, p.x - H, p.x + H);
+    gridInto(a, G.breakables, p.x - H, p.x + H);
+    dynInto(a, D.breakables, p.x - H, p.x + H);
+    for (var i = 0; i < a.length; i++) {
+      var s = a[i];
+      if (p.y + H <= s.y0 + C.EPS || p.y - H >= s.y1 - C.EPS) continue;
+      if (s.ref) { if (out.breaks.indexOf(s) < 0) out.breaks.push(s); continue; }
+      if (p.x + H <= s.x0 + C.EPS || p.x - H >= s.x1 - C.EPS) continue;
+      if (p.vx > 0) p.x = s.x0 - H;
+      else if (p.vx < 0) p.x = s.x1 + H;
+      p.vx = 0;
     }
   }
 
@@ -953,9 +1016,11 @@ var GameSim = (function () {
     if (!lv.orbs) lv.orbs = [];
     if (!lv.slopes) lv.slopes = [];
     if (!lv.coins) lv.coins = [];
+    if (!lv.checkpoints) lv.checkpoints = [];
     if (!lv.g) buildGrids(lv);
-    var out = { died: false, portal: null, speed: null, teleportY: null, coins: [], breaks: [] };
+    var out = { died: false, portal: null, speed: null, teleportY: null, coins: [], breaks: [], checkpoint: null };
     var dt = sub * C.D;
+    var stepInput = input;
     p.tickN++;
     p.lastY = p.y;
     p.lastX = p.x;
@@ -964,30 +1029,59 @@ var GameSim = (function () {
       p.pendingVelocity = null;
     }
     // dash orb: the dash ends on release or on landing; presses are inert while dashing
-    if (p.dashing && (!input.hold || p.onGround)) { p.dashing = false; p.dashVy = 0; }
+    if (p.dashing && (!stepInput.hold || p.onGround)) { p.dashing = false; p.dashVy = 0; }
     if (p.dashing) {
       p.vy = p.dashVy;
     } else {
-      if (input.pressed) onPress(p, lv, out);
+      if (stepInput.pressed) onPress(p, lv, out);
       if (out.died) { p.dead = true; return out; }
       switch (p.mode) {
-        case 'cube': cubeJump(p, dt, input.hold); break;
-        case 'ship': shipFly(p, dt, input.hold); break;
-        case 'ball': ballJump(p, dt, input.pressed); break;
-        case 'ufo': ufoJump(p, dt, input.pressed, input.hold); break;
-        case 'wave': waveMove(p, input.hold); break;
-        case 'robot': robotJump(p, dt, input.hold, input.pressed); break;
+        case 'cube': cubeJump(p, dt, stepInput.hold); break;
+        case 'ship': shipFly(p, dt, stepInput.hold); break;
+        case 'ball': ballJump(p, dt, stepInput.pressed); break;
+        case 'ufo': ufoJump(p, dt, stepInput.pressed, stepInput.hold); break;
+        case 'wave': waveMove(p, stepInput.hold); break;
+        case 'robot': robotJump(p, dt, stepInput.hold, stepInput.pressed); break;
         case 'spider': spiderFall(p, dt); break;
         case 'swing': swingMove(p, dt); break;
       }
     }
     if (p.dead) return out;
     p.y += p.vy * dt;
+    // Platformer controls use damped horizontal velocity and the same grid-based solid data.
+    // A held direction accelerates toward the current speed-portal limit; neutral input applies
+    // friction. Stop Move remains latched until all movement keys are released.
+    if (stepInput.platformer) {
+      var moveLeft = !!stepInput.left, moveRight = !!stepInput.right;
+      if (p.stopMoveUntilRelease) {
+        if (!moveLeft && !moveRight) p.stopMoveUntilRelease = false;
+        p.vx = 0;
+      } else {
+        var moveDir = moveRight === moveLeft ? 0 : (moveRight ? 1 : -1);
+        moveDir *= (p.dirSign || 1);
+        if (moveDir) {
+          var targetVX = moveDir * p.speed;
+          p.vx += (targetVX - p.vx) * Math.min(1, dt * 3.5);
+        } else {
+          p.vx *= Math.pow(0.80, sub / 0.25);
+          if (Math.abs(p.vx) < 0.015) p.vx = 0;
+        }
+      }
+      p.x += p.vx * dt;
+      collideHorizontal(p, lv, out);
+    }
     // reference cap: the player dies above the level top (7560 in 2x units)
     if (p.y > 3780 || p.y < -3780) { out.died = true; }
-    collide(p, lv, out, input);
+    collide(p, lv, out, stepInput);
     if (out.died) p.dead = true;
-    if (!p.dead) p.x += sub * p.speed * C.D;
+    if (!p.dead && !stepInput.platformer) p.x += sub * p.speed * C.D * (p.dirSign || 1);     // classic auto-run
+    // Platformer checkpoint diamonds activate on contact and remain latched until another is touched.
+    if (!p.dead && stepInput.platformer) {
+      for (var ci = 0; ci < lv.checkpoints.length; ci++) {
+        var cp = lv.checkpoints[ci];
+        if (overlaps(p.x - p.half, p.x + p.half, p.y - p.half, p.y + p.half, cp)) { out.checkpoint = cp; break; }
+      }
+    }
     // reference getFloorY()/getCeilingY() post-collision clamps (player.js): while a fly
     // corridor is active its floor REPLACES the world ground — ships, ufo, wave, ball, spider
     // and the normal-gravity cube ride it, and the wave uses its small hitbox size. The
@@ -995,7 +1089,7 @@ var GameSim = (function () {
     // fly-band ceiling when gravity is flipped); cube and robot are exempt ('iscube').
     var flySize = p.mode === 'wave' ? (p.isMini ? 3 : 4.5) : p.half;
     var flyCubeM = p.mode === 'cube' || p.mode === 'robot';
-    if (!p.dead && p.flyFloor !== null && p.flyFloor !== undefined) {
+    if (!p.dead && !p.freeModeCamera && !stepInput.freeModeCamera && p.flyFloor !== null && p.flyFloor !== undefined) {
       if (p.y <= p.flyFloor + flySize && (p.vy <= 0 || p.onGround)) {
         if (!p.flip || !flyCubeM) {
           p.y = p.flyFloor + flySize; p.vy = 0;
@@ -1005,7 +1099,7 @@ var GameSim = (function () {
         }
       }
     }
-    if (!p.dead && p.flyCeil !== null && p.flyCeil !== undefined && !flyCubeM) {
+    if (!p.dead && !p.freeModeCamera && !stepInput.freeModeCamera && p.flyCeil !== null && p.flyCeil !== undefined && !flyCubeM) {
       if (p.y + flySize >= p.flyCeil) {
         // reference hitGround + onCeiling: the spider can teleport from a pinned ceiling
         p.y = p.flyCeil - flySize; p.vy = 0; p.onGround = false; p.onCeiling = true; p.canJump = true; p.isJumping = false;

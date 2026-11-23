@@ -9,7 +9,7 @@
   // decorations: frame atlas and the two game sprite sheets (embedded data URIs)
   var DECOR_ATLAS = DECOR_DATA.atlas;
   var SHEET_IMG = [], SHEET_OK = [];
-  if (typeof Image !== 'undefined') {
+  if (typeof Image !== 'undefined' && window.RR_TIER !== 'none') {
     DECOR_DATA.sheets.forEach(function (src, si) {
       var im = new Image();
       im.onload = function () { SHEET_OK[si] = true; dirty = true; };
@@ -47,7 +47,8 @@
   var frozen = false;             // test hook: pause the simulation, move the camera freely
   var attempts = 1;
   var p = null, p2 = null;        // p2 = dual-mode partner
-  var holding = false, pressQueued = false;
+  var holding = false, pressQueued = false, leftHeld = false, rightHeld = false;
+  var checkpointState = null, activeCheckpointKey = null, fallSpeedLowActive = false;
   var acc = 0, lastNow = 0;
   var playCamY = 0;
   // reference mirror-portal animation (game-scene _stepMirror: 0.4 s, pow-1.2 ease, visual flips at halfway)
@@ -70,6 +71,7 @@
     p = GS.newPlayer(0, 15, 'cube');
     p.onGround = true; p.canJump = true;
     p2 = null;
+    leftHeld = false; rightHeld = false; checkpointState = null; activeCheckpointKey = null; fallSpeedLowActive = false;
     coinsGot = {}; coinCount = 0;
     // only the blocks broken during the last run need restoring; the sim is rebuilt only if there were any
     if (brokenList.length) {
@@ -139,7 +141,7 @@
         LEVEL = res.level;
         var skipped = 0;
         Object.keys(res.skipped).forEach(function (k) { skipped += res.skipped[k]; });
-        flash('Loaded ' + L.name + ' by ' + L.creator + ': ' + LEVEL.objs.length + ' objects, ' + skipped + ' unsupported skipped.');
+        flash('Loaded ' + L.name + ' by ' + L.creator + ': ' + LEVEL.objs.length + ' objects, ' + skipped + ' unsupported skipped, ' + inertCount() + ' inert triggers (not simulated).');
       } catch (e) {
         LEVEL = LevelModel.fromTemplate([]);
         flash('Could not load ' + L.name + ': ' + e.message);
@@ -148,6 +150,7 @@
       levelIsDefault = false;
     }
     LEVEL_NAME = L.name;
+    syncPlatformerUI();
     snapshotPalette();
     decodeDemo();
     markLevel();
@@ -207,13 +210,14 @@
     holding = true;
     dirty = true;
   }
-  function releaseJump() { holding = false; }
+  function releaseJump() { holding = false; if (p) p.stopJumpUntilRelease = false; if (p2) p2.stopJumpUntilRelease = false; }
 
   // ---- portals ----
   function copyState(src, dst) {
     dst.x = src.x; dst.y = src.y; dst.lastY = src.lastY; dst.lastX = src.lastX; dst.vy = src.vy; dst.rot = src.rot;
     dst.mode = src.mode; dst.flip = src.flip; dst.mirrored = src.mirrored;
     dst.speed = src.speed; dst.grav = src.grav; dst.yStart = src.yStart;
+    dst.dirSign = src.dirSign || 1;
     dst.onGround = src.onGround; dst.canJump = src.canJump; dst.isJumping = src.isJumping;
     dst.half = src.half; dst.inner = src.inner; dst.isMini = src.isMini;
     dst.robotAccel = src.robotAccel; dst.gdAccel = src.gdAccel;
@@ -226,6 +230,7 @@
     if (p2) return;
     p2 = GS.newPlayer(p.x, p.y, p.mode);
     copyState(p, p2);
+    p2.gravityScale = p2GravityScale;
     // a ball's partner plays with the opposite gravity
     if (p.mode === 'ball') GS.flipGravity(p2, !p.flip, 1.0);
   }
@@ -258,31 +263,129 @@
     GS.setMode(pl, kind, r && r.portalY !== undefined ? r.portalY : undefined);
   }
 
-  // reference camera: _updateCameraY (2x units, px)
+  // Camera 2.2 controls. The camera remains a Canvas 2D transform: no shader or WebGL path.
   var CAM_LOCK_MODES = { ship: true, ufo: true, wave: true, ball: true, spider: true };
-  function updatePlayCamera(snap) {
-    // fly modes lock the camera on the centre of their fly bounds (Web Dashers' flyCameraTarget),
-    // in the same 2x units as the normal follow, and ease toward it. The target is recomputed
-    // every frame from the CURRENT corridor — reference setFlyMode updates flyCameraTarget on
-    // every portal, so chained fly sections with different corridors re-lock correctly
-    if (CAM_LOCK_MODES[p.mode] && p.flyCeil !== null && p.flyCeil !== undefined) {
-      var fc = (p.flyFloor + p.flyCeil) / 2;
-      var lt = Math.max(0, 2 * fc - 320 + REF_O), lc = playCamY;
-      if (snap) playCamY = lt; else playCamY = lc + (lt - lc) * 0.1;
+  var camZoom = 1, camOffX = 0, camOffY = 0, camLocked = false, camTweens = [], camAngle = 0, camWorldX = 0;
+  var cameraStatic = null, cameraEdges = {};
+  var freeCameraMode = false, freeCamEasing = 1, freeCamPadding = 0;
+  var timeWarp = 1, lastTriggerX = null, triggerSweep = null, trigTouching = {};
+  var p1GravityScale = 1, p2GravityScale = 1;
+  function playerNow() { return p; }
+  function startCamAngle(tp) {
+    var target = tp.add ? camAngle + (tp.degrees || 0) : (tp.degrees || 0);
+    if (tp.snap360) {
+      while (target > 180) target -= 360;
+      while (target < -180) target += 360;
+    }
+    camTweens.push({ key: 'angle', from: camAngle, to: target, n: camFrames(tp.dur), t: 0, easingType: tp.easingType || 0, easingRate: tp.easingRate === undefined ? 2 : tp.easingRate });
+  }
+  function applyGameplayRotate(tp, pl) {
+    if (!pl) return;
+    var sideways = tp.ground === 3 || tp.ground === 4;
+    var flipped = tp.ground === 1 || tp.ground === 4, reversed = tp.move === 2 || tp.move === 3;
+    var oldDir = pl.dirSign || 1;
+    if (!!pl.sideways !== sideways) {
+      pl.sideways = sideways; pl.vy = pl.speed;
+      pl.onGround = false; pl.onCeiling = false; pl.canJump = false;
+    }
+    if (!!pl.flip !== flipped) GS.flipGravity(pl, flipped, 1.0);
+    pl.dirSign = reversed ? -1 : 1;
+    if (pl === p && oldDir !== pl.dirSign) emitGameplayEvent(75, 1);
+  }
+  function camFrames(sec) { return Math.max(0, Math.round((sec || 0) * 60)); }
+  function startCamZoom(params) { camTweens.push({ key: 'zoom', from: camZoom, to: params.zoom, n: camFrames(params.dur), t: 0, easingType: params.easingType || 0, easingRate: params.easingRate === undefined ? 2 : params.easingRate }); }
+  function startCamOffset(params) {
+    var n = camFrames(params.dur);
+    if (params.axis !== 2) camTweens.push({ key: 'offX', from: camOffX, to: params.dx || 0, n: n, t: 0, easingType: params.easingType || 0, easingRate: params.easingRate === undefined ? 2 : params.easingRate });
+    if (params.axis !== 1) camTweens.push({ key: 'offY', from: camOffY, to: params.dy || 0, n: n, t: 0, easingType: params.easingType || 0, easingRate: params.easingRate === undefined ? 2 : params.easingRate });
+  }
+  function startStaticCamera(params) {
+    if (params.exit) {
+      var snapExit = !!params.exitInstant;
+      cameraStatic = null; camLocked = false;
+      if (snapExit) updatePlayCamera(true, 1);
       return;
     }
-    var yr = 2 * p.y;
-    var cy = playCamY, T = cy;
-    var A = cy - REF_O + 320;
-    if (!p.flip) {
-      if (yr > A + 140) T = yr - 320 - 140 + REF_O;
-      else if (yr < A - 80) T = yr - 320 + 80 + REF_O;
-    } else {
-      if (yr > A + 80) T = yr - 320 - 80 + REF_O;
-      else if (yr < A - 140) T = yr - 320 + 140 + REF_O;
+    var target = findGroupPosition(params.target);
+    if (!target) return;
+    cameraStatic = { group: params.target, follow: !!params.follow, axis: params.axis || 0, anchorX: target.x, anchorY: target.y,
+      fromX: camWorldX, fromY: playCamY, elapsed: 0, duration: camFrames(params.dur),
+      easingType: params.easingType || 0, easingRate: params.easingRate === undefined ? 2 : params.easingRate,
+      followEasing: Math.max(0.1, params.followEasing || 1), smoothVelocity: !!params.smoothVelocity, smoothVelocityMod: params.smoothVelocityMod === undefined ? 1 : params.smoothVelocityMod };
+    camLocked = true;
+  }
+  function tickCamera(frameScale) {
+    frameScale = frameScale === undefined ? 1 : frameScale;
+    for (var i = camTweens.length - 1; i >= 0; i--) {
+      var tw = camTweens[i]; tw.t += frameScale;
+      var f = Math.min(1, tw.t / Math.max(1, tw.n));
+      f = easingSample(tw.easingType || 0, tw.easingRate === undefined ? 2 : tw.easingRate, f);
+      var v = tw.from + (tw.to - tw.from) * f;
+      if (tw.key === 'zoom') camZoom = v; else if (tw.key === 'offX') camOffX = v; else if (tw.key === 'offY') camOffY = v; else camAngle = v;
+      if (tw.t >= Math.max(1, tw.n)) camTweens.splice(i, 1);
     }
-    if (T < 0) T = 0;
-    if (snap) playCamY = T; else playCamY = cy + (T - cy) * 0.1;
+  }
+  function applyCameraEdges() {
+    var z = Math.max(0.1, camZoom || 1), pos;
+    pos = cameraEdges[1] ? findGroupPosition(cameraEdges[1]) : null;
+    if (pos) { var minX = pos.x + CENTER_X / (2 * z) - camOffX; if (camWorldX < minX) camWorldX = minX; }
+    pos = cameraEdges[2] ? findGroupPosition(cameraEdges[2]) : null;
+    if (pos) { var maxX = pos.x - (CW - CENTER_X) / (2 * z) - camOffX; if (camWorldX > maxX) camWorldX = maxX; }
+    pos = cameraEdges[3] ? findGroupPosition(cameraEdges[3]) : null;
+    if (pos) { var topY = (playCamY + GROUND_SY) / (2 * z) + camOffY; if (topY > pos.y) playCamY = -GROUND_SY + 2 * z * (pos.y - camOffY); }
+    pos = cameraEdges[4] ? findGroupPosition(cameraEdges[4]) : null;
+    if (pos) { var bottomY = (playCamY + GROUND_SY - CH) / (2 * z) + camOffY; if (bottomY < pos.y) playCamY = CH - GROUND_SY + 2 * z * (pos.y - camOffY); }
+  }
+  function updatePlayCamera(snap, frameScale) {
+    frameScale = frameScale === undefined ? (timeWarp || 1) : frameScale;
+    if (!p) return;
+    if (cameraStatic) {
+      var target = cameraStatic.follow ? findGroupPosition(cameraStatic.group) : { x: cameraStatic.anchorX, y: cameraStatic.anchorY };
+      if (target) {
+        var tx = target.x - camOffX;
+        var ty = CH / 2 - GROUND_SY + 2 * camZoom * (target.y - camOffY);
+        var axisX = cameraStatic.axis !== 2, axisY = cameraStatic.axis !== 1;
+        if (cameraStatic.duration > 0 && cameraStatic.elapsed < cameraStatic.duration) {
+          cameraStatic.elapsed = Math.min(cameraStatic.duration, cameraStatic.elapsed + frameScale);
+          var f = easingSample(cameraStatic.easingType, cameraStatic.easingRate, cameraStatic.elapsed / cameraStatic.duration);
+          if (axisX) camWorldX = cameraStatic.fromX + (tx - cameraStatic.fromX) * f;
+          if (axisY) playCamY = cameraStatic.fromY + (ty - cameraStatic.fromY) * f;
+        } else if (cameraStatic.follow) {
+          var follow = 1 - Math.pow(0.9, frameScale * cameraStatic.followEasing * (cameraStatic.smoothVelocity ? Math.max(0.1, cameraStatic.smoothVelocityMod) : 1));
+          if (axisX) camWorldX += (tx - camWorldX) * follow;
+          if (axisY) playCamY += (ty - playCamY) * follow;
+        } else {
+          // A non-follow Static Camera is a fixed anchor, not a one-time tween that
+          // falls back to the player camera as soon as its move time has elapsed.
+          if (axisX) camWorldX = tx;
+          if (axisY) playCamY = ty;
+        }
+      }
+    } else {
+      camWorldX = p.x;
+      // The Camera Mode trigger can release the normal fly-corridor camera lock.
+      if (!freeCameraMode && CAM_LOCK_MODES[p.mode] && p.flyCeil !== null && p.flyCeil !== undefined) {
+        var fc = (p.flyFloor + p.flyCeil) / 2;
+        var flyTarget = Math.max(0, 2 * fc - 320 + REF_O), flyFollow = 1 - Math.pow(0.9, frameScale);
+        if (snap) playCamY = flyTarget; else playCamY += (flyTarget - playCamY) * flyFollow;
+      } else {
+        var yr = 2 * p.y, cy = playCamY, targetY = cy;
+        var pad = freeCameraMode ? freeCamPadding * CH * 0.5 : 0;
+        var topThreshold = 140 + pad, bottomThreshold = 80 + pad;
+        var A = cy - REF_O + 320;
+        if (!p.flip) {
+          if (yr > A + topThreshold) targetY = yr - 320 - topThreshold + REF_O;
+          else if (yr < A - bottomThreshold) targetY = yr - 320 + bottomThreshold + REF_O;
+        } else {
+          if (yr > A + bottomThreshold) targetY = yr - 320 - bottomThreshold + REF_O;
+          else if (yr < A - topThreshold) targetY = yr - 320 + topThreshold + REF_O;
+        }
+        if (targetY < 0) targetY = 0;
+        var camEase = 1 - Math.pow(0.9, frameScale * (freeCameraMode ? freeCamEasing : 1));
+        if (snap) playCamY = targetY; else playCamY += (targetY - playCamY) * camEase;
+      }
+    }
+    applyCameraEdges();
   }
 
   // reference _mirrorProgress / toggleMirror / _stepMirror (game-scene.js): the world reflects
@@ -326,7 +429,7 @@
   // scroll / ground shift -> ground band animation
   function stepVisualAnims(dtSec) {
     stepMirror(dtSec);
-    var camPx = 2 * (p ? p.x : 0);
+    var camPx = 2 * (p ? camWorldX : 0);
     if (prevCamPx === null) prevCamPx = camPx;
     var dCam = camPx - prevCamPx;
     if (dCam) {
@@ -340,8 +443,20 @@
 
   function coinKey(c) { return c.cx + ',' + c.cy; }
 
-  function stepOne(pl, i, lv, hold, pressed, end) {
-    var r = GS.step(pl, 0.25, { pressed: pressed, hold: hold }, lv);
+  // sideways gameplay: exchange the player's x and y (and the last positions) around the step, and step
+  // on the transposed collision copy (reference _swapSidewaysFrame)
+  function swapSidewaysFrame(pl) {
+    var t = pl.x; pl.x = pl.y; pl.y = t;
+    t = pl.lastX; pl.lastX = pl.lastY; pl.lastY = t;
+  }
+  function stepOne(pl, sub, lv, hold, pressed, end) {
+    var sideways = !!pl.sideways;
+    if (sideways) swapSidewaysFrame(pl);
+    var lvStep = sideways ? LevelModel.transposeSim(lv) : lv;
+    var playerPressed = pressed && !pl.stopJumpUntilRelease;
+    var playerHold = hold && !pl.stopJumpUntilRelease;
+    var r = GS.step(pl, sub, { pressed: playerPressed, hold: playerHold, platformer: !!LEVEL.platformer, left: pl === p ? leftHeld : false, right: pl === p ? rightHeld : false, freeModeCamera: freeCameraMode }, lvStep);
+    if (sideways) swapSidewaysFrame(pl);
     if (r.portal) {
       // stacked portals arrive as an array (gamemode + gravity + size at the same spot)
       if (r.portal instanceof Array) {
@@ -349,14 +464,17 @@
       } else applyPortal(r.portal, r, pl);
     }
     if (r.speed !== null) GS.setSpeed(pl, r.speed);
+    if (r.checkpoint) activateCheckpoint(r.checkpoint, pl);
     for (var k = 0; k < r.coins.length; k++) {
-      var ck = coinKey(lv.coins[r.coins[k]]);
+      var coinObj = lvStep.coins[r.coins[k]];
+      var ck = coinKey(coinObj.orig || coinObj);
       if (!coinsGot[ck]) { coinsGot[ck] = true; coinCount++; }
     }
     if (r.breaks.length) {
       var newlyBroken = false;
       for (var bk = 0; bk < r.breaks.length; bk++) {
         var block = r.breaks[bk];
+        if (block && block.orig) block = block.orig;     // breaks from the transposed copy map back to the level
         // The level snapshot is reused for all four substeps in a frame. Ignore duplicate
         // contacts after the first one has already marked this object as broken.
         if (block && !block.broken) {
@@ -370,7 +488,7 @@
     return r;
   }
 
-  // ---- groups and triggers (gameplay subset: toggle, alpha, move, stop; spawn or touch) ----
+  // ---- groups and triggers (legacy object triggers plus Canvas-compatible 2.2 gameplay triggers) ----
   var groupState = {}, trigFired = {}, groupQueue = [], frameNo = 0;
   var groupCenterCache = {}, channelPulses = [];
   var dynDirty = true, lastDynLevel = null;   // grouped objects are rebuilt only when the group state changes
@@ -419,12 +537,15 @@
     }
     return { dx: dx, dy: dy, hidden: hidden, alpha: alpha, rotation: rotation, pivot: pivot, centerGroup: centerGroup, lockRotation: lockRotation, pulseTint: pulseTint };
   }
+  var GC_MEMO = { objs: null, rev: -1, len: -1 };
   function rebuildGroupCenters() {
+    if (GC_MEMO.objs === LEVEL.objs && GC_MEMO.rev === (LEVEL.revision || 0) && GC_MEMO.len === LEVEL.objs.length) return;
+    GC_MEMO.objs = LEVEL.objs; GC_MEMO.rev = LEVEL.revision || 0; GC_MEMO.len = LEVEL.objs.length;
     var acc = {};
     if (!LEVEL || !LEVEL.objs) { groupCenterCache = {}; return; }
     LEVEL.objs.forEach(function (o) {
-      if (!o.groups || !o.groups.length || LevelModel.kindOf(o.id) === 'trigger' || LevelModel.kindOf(o.id) === 'fx') return;
-      var fp = LevelModel.footprint(o), cx = o.gx * CELL + fp.w * CELL / 2, cy = o.gy * CELL + fp.h * CELL / 2;
+      if (!o.groups || !o.groups.length || kindFast(o) === 'trigger' || (kindFast(o) === 'fx' && o.id !== 2016)) return;
+      var fp = footFast(o), cx = o.gx * CELL + fp.w * CELL / 2, cy = o.gy * CELL + fp.h * CELL / 2;
       o.groups.forEach(function (gid) {
         if (!acc[gid]) acc[gid] = { x: 0, y: 0, n: 0 };
         acc[gid].x += cx; acc[gid].y += cy; acc[gid].n++;
@@ -479,23 +600,24 @@
     else v = 0;
     return Math.round(v * 32) / 32;
   }
-  function tickTweens() {
+  function tickTweens(frameScale) {
+    frameScale = frameScale === undefined ? 1 : frameScale;
     Object.keys(groupState).forEach(function (g) {
       var s = groupState[g], j, tw, f;
       if (s.tweens.length || s.atw || s.rotTweens.length) dynDirty = true;
       for (j = s.tweens.length - 1; j >= 0; j--) {
-        tw = s.tweens[j]; tw.t++;
+        tw = s.tweens[j]; tw.t += frameScale;
         if (tw.t >= tw.dur) { s.bx += tw.dx; s.by += tw.dy; s.tweens.splice(j, 1); }
       }
       if (s.atw) {
-        s.atw.t++;
+        s.atw.t += frameScale;
         f = Math.min(1, s.atw.t / s.atw.dur);
         f = easingSample(s.atw.easingType, s.atw.easingRate, f);
         s.alpha = s.atw.from + (s.atw.to - s.atw.from) * f;
         if (f >= 1) s.atw = null;
       }
       for (j = s.rotTweens.length - 1; j >= 0; j--) {
-        tw = s.rotTweens[j]; tw.t++;
+        tw = s.rotTweens[j]; tw.t += frameScale;
         var rp = Math.min(1, tw.t / tw.dur);
         var rs = easingSample(tw.easingType, tw.easingRate, rp);
         var ps = easingSample(tw.easingType, tw.easingRate, tw.prev);
@@ -504,7 +626,7 @@
         if (rp >= 1) s.rotTweens.splice(j, 1);
       }
       for (j = s.pulses.length - 1; j >= 0; j--) {
-        var pulse = s.pulses[j]; pulse.t++;
+        var pulse = s.pulses[j]; pulse.t += frameScale;
         var sec = pulse.t / 60;
         var intensity = pulseIntensity(sec, pulse.fadeIn, pulse.hold, pulse.fadeOut);
         pulse.tint = intensity > 0.01 ? rgbStr({ r: pulse.r * intensity, g: pulse.g * intensity, b: pulse.b * intensity }) : null;
@@ -512,7 +634,7 @@
       }
     });
     for (var cp = channelPulses.length - 1; cp >= 0; cp--) {
-      var chp = channelPulses[cp]; chp.t++;
+      var chp = channelPulses[cp]; chp.t += frameScale;
       var cs = chp.t / 60, ci = pulseIntensity(cs, chp.fadeIn, chp.hold, chp.fadeOut);
       if (ci > 0.01) LEVEL.palette[chp.channel] = rgbStr({ r: chp.base.r + (chp.r - chp.base.r) * ci, g: chp.base.g + (chp.g - chp.base.g) * ci, b: chp.base.b + (chp.b - chp.base.b) * ci });
       else LEVEL.palette[chp.channel] = rgbStr(chp.base);
@@ -529,8 +651,130 @@
     s.pulses = [];
     s.atw = null;
   }
+  // triggers the build recognises but does not simulate (particles, shaders, tints, ...): shown in the load message
+  function inertCount() {
+    var n = 0;
+    if (LEVEL && LEVEL.objs) for (var i = 0; i < LEVEL.objs.length; i++) {
+      var o = LEVEL.objs[i];
+      if (kindFast(o) === 'fx') n++;
+    }
+    return n;
+  }
+  function findGroupPosition(groupId) {
+    if (!(groupId > 0) || !groupCenterCache[groupId]) return null;
+    // Match the game's group-centre lookup, including currently active group motion and
+    // centre-group rotation, rather than picking an arbitrary object in the target group.
+    var base = groupCenterCache[groupId], inf = groupInfo([groupId]);
+    var x = base.x + inf.dx, y = base.y + inf.dy;
+    if (inf.rotation && inf.centerGroup > 0 && inf.pivot) {
+      var dx = x - inf.pivot.x, dy = y - inf.pivot.y;
+      var c = Math.cos(inf.rotation), sn = -Math.sin(inf.rotation);
+      x = inf.pivot.x + dx * c - dy * sn;
+      y = inf.pivot.y + dx * sn + dy * c;
+    }
+    return { x: x, y: y };
+  }
+  function applyPlayerControl(target, params) {
+    if (!target) return;
+    // Stop Jump releases an existing held/queued jump; it is not a permanent input lock.
+    // A fresh press is accepted again after the player releases the current hold.
+    if (params.stopJump && (holding || pressQueued)) target.stopJumpUntilRelease = true;
+    if (params.stopMove && (leftHeld || rightHeld)) target.stopMoveUntilRelease = true;
+    if (params.stopSlide) target.vx = 0;
+    if (params.stopRotate) { target.rotActive = false; target.rot = 0; }
+  }
+  // Event Trigger (3604) links verified gameplay event codes to an ordinary spawn group.
+  // Only event codes confirmed by the reference documentation are emitted here.
+  function emitGameplayEvent(code, playerSlot, extraId) {
+    var list = LEVEL.sim().triggers;
+    for (var i = 0; i < list.length; i++) {
+      var eventTrigger = list[i];
+      if (eventTrigger.kind !== 'event') continue;
+      var params = eventTrigger.p || {}, events = params.events || [];
+      if (events.indexOf(code) < 0) continue;
+      if (params.player && params.player !== playerSlot) continue;
+      if (params.extraId && extraId !== undefined && params.extraId !== extraId) continue;
+      if (params.extraId && extraId === undefined) continue;
+      if (trigFired[i] && !params.multiTrigger) continue;
+      if (!params.multiTrigger) trigFired[i] = true;
+      if (params.target > 0) groupQueue.push({ group: params.target, at: frameNo });
+    }
+  }
+  function activateCheckpoint(checkpoint, pl) {
+    if (!LEVEL.platformer || pl !== p || !checkpoint) return;
+    var key = String(checkpoint.cx) + ':' + String(checkpoint.cy);
+    if (key === activeCheckpointKey) return;
+    activeCheckpointKey = key;
+    checkpointState = { x: checkpoint.cx, y: checkpoint.cy, mode: pl.mode, speed: pl.speed, flip: !!pl.flip, mirrored: !!pl.mirrored, gravityScale: pl.gravityScale || 1, dirSign: pl.dirSign || 1 };
+  }
+  function respawnAtCheckpoint() {
+    if (!checkpointState) return false;
+    var cp = checkpointState;
+    p = GS.newPlayer(cp.x, cp.y, cp.mode);
+    GS.setSpeed(p, cp.speed);
+    if (cp.flip) GS.flipGravity(p, true, 1);
+    p.gravityScale = cp.gravityScale; p.dirSign = cp.dirSign; p.mirrored = cp.mirrored;
+    p.onGround = false; p.canJump = false; p.lastX = p.x; p.lastY = p.y; p.vx = 0; p.vy = 0;
+    p.frameStartY = p.y; p.frameDeltaY = 0;
+    p.stopMoveUntilRelease = false; p.stopJumpUntilRelease = false; p.freeModeCamera = freeCameraMode;
+    lastTriggerX = p.x; triggerSweep = null;
+    emitGameplayEvent(64, 1);
+    return true;
+  }
+
   function fireTrigger(t) {
     var p = t.p, g = p.target;
+    if (t.kind === 'reverse') {
+      if (playerNow()) playerNow().dirSign = -(playerNow().dirSign || 1);
+      if (p2) p2.dirSign = -(p2.dirSign || 1);
+      emitGameplayEvent(75, 1);
+      return;
+    }
+    if (t.kind === 'gravity') {
+      var strength = Math.max(0.1, Math.min(2, p.gravity === undefined ? 1 : p.gravity));
+      if (p.p1 !== false) { p1GravityScale = strength; if (playerNow()) playerNow().gravityScale = strength; }
+      if (p.p2 !== false) { p2GravityScale = strength; if (p2) p2.gravityScale = strength; }
+      return;
+    }
+    if (t.kind === 'playerControl') {
+      if (p.p1 !== false) applyPlayerControl(playerNow(), p);
+      if (p.p2 !== false) applyPlayerControl(p2, p);
+      return;
+    }
+    if (t.kind === 'timewarp') {
+      timeWarp = Math.max(0.1, Math.min(2, p.timeMod === undefined ? 1 : p.timeMod));
+      return;
+    }
+    if (t.kind === 'teleport') {
+      var destination = findGroupPosition(g), pl = playerNow();
+      if (!destination || !pl) return;
+      var oldX = pl.x, oldY = pl.y;
+      if (!p.usePlayerX) pl.x = destination.x;
+      if (!p.usePlayerY) pl.y = destination.y;
+      pl.lastX = pl.x; pl.lastY = pl.y;
+      if (Math.abs(pl.x - oldX) > 1e-6 || Math.abs(pl.y - oldY) > 1e-6) {
+        pl.onGround = false; pl.onCeiling = false; pl.canJump = false;
+      }
+      if (p.gravityMode === 1) GS.flipGravity(pl, false, 1);
+      else if (p.gravityMode === 2) GS.flipGravity(pl, true, 1);
+      else if (p.gravityMode === 3) GS.flipGravity(pl, !pl.flip, 1);
+      return;
+    }
+    if (t.kind === 'end') {
+      status = 'won';
+      return;
+    }
+    if (t.kind === 'zoom') { startCamZoom(p); return; }
+    if (t.kind === 'camoffset') { startCamOffset(p); return; }
+    if (t.kind === 'static') { startStaticCamera(p); return; }
+    if (t.kind === 'cameraEdge') { if (p.edge >= 1 && p.edge <= 4) { if (g > 0) cameraEdges[p.edge] = g; else delete cameraEdges[p.edge]; } return; }
+    if (t.kind === 'cameraMode') { freeCameraMode = !!p.freeMode; if (p.editSettings) { freeCamEasing = Math.max(1, Math.min(40, p.easing || 1)); freeCamPadding = Math.max(0, Math.min(1, p.padding || 0)); } return; }
+    if (t.kind === 'camrot') { startCamAngle(t.p); return; }
+    if (t.kind === 'rotategp') {
+      if (t.p.changeChannel) setChannel(t.p.targetChannel, t.p.move === 2 || t.p.move === 3);
+      if (!t.p.channelOnly) applyGameplayRotate(t.p, playerNow());
+      return;
+    }
     if (t.kind === 'pulse') {
       var fadeIn = Math.max(0, p.fadeIn || 0), hold = Math.max(0, p.hold || 0), fadeOut = Math.max(0, p.fadeOut || 0);
       var total = fadeIn + hold + fadeOut;
@@ -562,6 +806,13 @@
   var targetsCache = {};
   function startTriggers() {
     groupState = {}; trigFired = {}; groupQueue = []; frameNo = 0; dynDirty = true; channelPulses = [];
+    timeWarp = 1; lastTriggerX = null; triggerSweep = null; trigTouching = {};
+    p1GravityScale = 1; p2GravityScale = 1;
+    if (p) { p.gravityScale = 1; p.stopJumpUntilRelease = false; }
+    if (p2) { p2.gravityScale = 1; p2.stopJumpUntilRelease = false; }
+    camZoom = 1; camOffX = 0; camOffY = 0; camLocked = false; camTweens = []; camAngle = 0;
+    setupChannels();
+    camWorldX = p ? p.x : 0; cameraStatic = null; cameraEdges = {}; freeCameraMode = false; freeCamEasing = 1; freeCamPadding = 0;
     rebuildGroupCenters();
     targetsCache = spawnTargets();
     startColourTriggers();
@@ -576,32 +827,88 @@
   }
   function fireTriggerAt(i) {
     var list = LEVEL.sim().triggers, t = list[i];
-    trigFired[i] = true;
+    if (!t.p.multiTrigger) trigFired[i] = true;
+    if (t.p.touch) trigTouching[i] = true;
     if (t.kind === 'spawn') {
       if (t.p.target) groupQueue.push({ group: t.p.target, at: frameNo + Math.round((t.p.delay || 0) * 60) });
       return;
     }
     fireTrigger(t);
   }
+  // Trigger channels (reference level-channels.js): triggers with a channel (key 170) wait in a per-channel list
+  // ordered by order (115) then position. A rotate-gameplay trigger with change-channel (171) sets the active
+  // channel (173) and its direction. Channel 0 stays positional.
+  var chLists = null, chActive = 0, chIdx = {}, chRev = {};
+  function setupChannels() {
+    chLists = null;
+    var list = LEVEL.sim().triggers, rots = [], a, b;
+    for (a = 0; a < list.length; a++) if (list[a].kind === 'rotategp') rots.push(list[a]);
+    var used = rots.some(function (t) { return t.p.changeChannel; }) || list.some(function (t) { return t.p.channel > 0 && !t.p.touch; });
+    if (!used) return;
+    // reference: rotate-gameplay triggers that are not real touches become positional when channels are used
+    rots.forEach(function (t) { t.p.touch = !!t.p.realTouch; });
+    var dirOf = {};
+    rots.slice().sort(function (x, y) { return x.left - y.left; }).forEach(function (t) {
+      if (!(t.p.targetChannel in dirOf)) dirOf[t.p.targetChannel] = t.p.move === 2 || t.p.move === 3;
+    });
+    chLists = new Map();
+    for (b = 0; b < list.length; b++) {
+      var tb = list[b];
+      if (!(tb.p.channel > 0) || tb.p.touch) continue;
+      if (!chLists.has(tb.p.channel)) chLists.set(tb.p.channel, []);
+      chLists.get(tb.p.channel).push({ i: b, ord: tb.p.ord || 0, x: tb.left });
+    }
+    chLists.forEach(function (entries, ch) {
+      var rev = !!dirOf[ch];
+      entries.sort(function (x, y) { return x.ord - y.ord || (rev ? y.x - x.x : x.x - y.x) || x.i - y.i; });
+    });
+    chActive = 0; chIdx = {}; chRev = {};
+  }
+  function setChannel(ch, rev) { chActive = ch; chRev[ch] = !!rev; }
+  function stepChannels() {
+    if (!chLists || !p) return;
+    var list = LEVEL.sim().triggers;
+    for (;;) {
+      var entries = chLists.get(chActive);
+      if (!entries) return;
+      var idx = chIdx[chActive] || 0;
+      if (idx >= entries.length) return;
+      var e = entries[idx], et = list[e.i];
+      var rev = !!chRev[chActive];
+      if (rev ? et.left < p.x : p.x < et.left) return;
+      chIdx[chActive] = idx + 1;
+      fireTriggerAt(e.i);
+    }
+  }
   function processTriggers() {
+    stepChannels();
     var list = LEVEL.sim().triggers, k, t, i, item;
     for (k = groupQueue.length - 1; k >= 0; k--) {
       item = groupQueue[k];
       if (frameNo < item.at) continue;
       groupQueue.splice(k, 1);
       for (i = 0; i < list.length; i++) {
-        if (!trigFired[i] && !list[i].p.touch && list[i].groups.indexOf(item.group) >= 0) fireTriggerAt(i);
+        if (!trigFired[i] && list[i].kind !== 'event' && !list[i].p.touch && list[i].groups.indexOf(item.group) >= 0) fireTriggerAt(i);
       }
     }
     if (!p) return;
     var targets = targetsCache;
+    var sweep = triggerSweep || { from: p.x, to: p.x, y: p.y, dir: p.dirSign || 1 };
     for (i = 0; i < list.length; i++) {
       t = list[i];
-      if (trigFired[i]) continue;
+      if (trigFired[i] || t.kind === 'event') continue;
       if (t.p.touch) {
-        if (p.x >= t.x0 - C.HALF && p.x <= t.x1 + C.HALF && p.y >= t.y0 - C.HALF && p.y <= t.y1 + C.HALF) fireTriggerAt(i);
-      } else if (!spawnOnly(t, targets) && p.x >= t.left) {
-        fireTriggerAt(i);
+        var inside = sweep.to >= t.x0 - C.HALF && sweep.to <= t.x1 + C.HALF && sweep.y >= t.y0 - C.HALF && sweep.y <= t.y1 + C.HALF;
+        var wasInside = trigTouching[i] === true;
+        trigTouching[i] = inside;
+        if (inside && !wasInside) fireTriggerAt(i);
+      } else if (!spawnOnly(t, targets) && !(chLists && t.p.channel > 0)) {
+        // A reverse sweep only fires triggers actually crossed since the previous frame.
+        // Merely being to the right of the player after reversing must not fire every trigger.
+        var crossed = sweep.dir < 0
+          ? (sweep.from > t.x && sweep.to <= t.x)
+          : (sweep.from < t.x && sweep.to >= t.x);
+        if (crossed) fireTriggerAt(i);
       }
     }
   }
@@ -648,10 +955,11 @@
       opFrom: opFrom, opTo: opTo
     });
   }
-  function tickColourTweens() {
+  function tickColourTweens(frameScale) {
+    frameScale = frameScale === undefined ? 1 : frameScale;
     for (var i = colourTweens.length - 1; i >= 0; i--) {
       var tw = colourTweens[i];
-      tw.t++;
+      tw.t += frameScale;
       var f = Math.min(1, tw.t / tw.dur);
       // reference ColorManager.step: a copy tween re-resolves its target while it runs
       if (tw.copy) {
@@ -672,23 +980,33 @@
       if (colTrigFired[i]) continue;
       // grouped colour triggers only fire through their spawn group, like the other triggers
       if (t.groups && t.groups.length && t.groups.some(function (g) { return targets[g]; })) continue;
+      var sweep = triggerSweep || { from: p.x, to: p.x, y: p.y, dir: p.dirSign || 1 };
       if (t.p.touch) {
-        if (p.x >= t.x0 - C.HALF && p.x <= t.x1 + C.HALF && p.y >= t.y0 - C.HALF && p.y <= t.y1 + C.HALF) {
+        if (sweep.to >= t.x0 - C.HALF && sweep.to <= t.x1 + C.HALF && sweep.y >= t.y0 - C.HALF && sweep.y <= t.y1 + C.HALF) {
           colTrigFired[i] = true; applyColourNow(t);
         }
-      } else if (p.x >= t.x) {
-        colTrigFired[i] = true; applyColourNow(t);
+      } else {
+        var crossed = sweep.dir < 0
+          ? (sweep.from > t.x && sweep.to <= t.x)
+          : (sweep.from < t.x && sweep.to >= t.x);
+        if (crossed) { colTrigFired[i] = true; applyColourNow(t); }
       }
     }
-    tickColourTweens();
+    tickColourTweens(timeWarp);
   }
 
   function advanceFrame() {
     if (status !== 'play') return;
-    frameNo++;
+    frameNo += timeWarp;
+    if (p) {
+      var fromX = lastTriggerX === null ? p.x : lastTriggerX;
+      triggerSweep = { from: fromX, to: p.x, y: p.y, dir: LEVEL.platformer ? (p.x >= fromX ? 1 : -1) : (p.dirSign || 1) };
+    } else triggerSweep = null;
     processTriggers();
     processColourTriggers();
-    tickTweens();
+    if (p) lastTriggerX = p.x;       // teleport triggers can relocate the player during this sweep
+    if (status !== 'play') { dirty = true; return; }
+    tickTweens(timeWarp); tickCamera(timeWarp);
     var lvNow = LEVEL.sim();
     if (dynDirty || lvNow !== lastDynLevel) {
       GameSim.refreshDyn(lvNow, groupInfo);
@@ -709,19 +1027,30 @@
     // GameSim itself runs four substeps and its lastY is updated per substep.
     p.frameStartY = p.y;
     if (p2) p2.frameStartY = p2.y;
-    for (var i = 0; i < 4; i++) {
+    var substeps = Math.max(1, Math.ceil(4 * timeWarp));
+    var subSize = timeWarp / substeps;
+    for (var i = 0; i < substeps; i++) {
       var pressed = pressQueued && i === 0;
       var hold = holding;
-      var r1 = stepOne(p, i, lv, hold, pressed, end);
-      var r2 = p2 ? stepOne(p2, i, lv, hold, pressed, end) : null;
-      if (p.dead || (p2 && p2.dead)) { status = 'dead'; demoActive = false; break; }
-      if (p.x >= end) { status = 'won'; demoActive = false; break; }
+      var r1 = stepOne(p, subSize, lv, hold, pressed, end);
+      var r2 = p2 ? stepOne(p2, subSize, lv, hold, pressed, end) : null;
+      if (p.dead || (p2 && p2.dead)) {
+        if (LEVEL.platformer && p.dead && checkpointState) { respawnAtCheckpoint(); break; }
+        status = 'dead'; demoActive = false; break;
+      }
+      if (!LEVEL.platformer && (((p.dirSign || 1) >= 0 && p.x >= end) || ((p.dirSign || 1) < 0 && p.x <= 0))) { status = 'won'; demoActive = false; break; }
     }
     p.frameDeltaY = p.y - p.frameStartY;
     if (p2) p2.frameDeltaY = p2.y - p2.frameStartY;
     pressQueued = false;
-    updatePlayCamera(false);
-    stepVisualAnims(FRAME_MS / 1000);
+    if (LEVEL.platformer && p && !p.dead) {
+      var gravityVelocity = p.vy * (p.flip ? -1 : 1);
+      var lowFall = gravityVelocity < 0 && Math.abs(gravityVelocity) <= 2;
+      if (lowFall && !fallSpeedLowActive) emitGameplayEvent(76, 1);
+      fallSpeedLowActive = lowFall;
+    }
+    updatePlayCamera(false, timeWarp);
+    stepVisualAnims(FRAME_MS / 1000 * timeWarp);
     dirty = true;
   }
 
@@ -874,37 +1203,38 @@
   // ---- background / ground textures (reference game-scene _bg tileSprite + _buildGround) ----
   // texture key kA6 -> file game_bg_<kA6 + 1>_001-hd.png ; kA7 -> groundSquare_0<kA7>_001.png
   var TEX_IMG = {}, TEX_OK = {};
-  // Bounded LRU for derived canvases (tint / flip / grey). Every colour a colour trigger passes
-  // through is a new key, so these maps must not grow for the life of the tab: beyond the limit the
-  // least recently used canvases are dropped and the browser can reclaim their backing stores.
-  var CANVAS_CACHE_BYTES = 48 * 1024 * 1024;
-  var canvasCache = { map: {}, order: [], bytes: 0, sizes: {} };
+  // Bounded LRU for derived canvases (tint / flip / grey). Lookup is one property read: each entry carries a
+  // use stamp. Over budget, the least recently used entries are dropped in one pass down to 75% of the budget,
+  // so eviction is rare. The budget is sized for phones (derived canvases are the main memory cost there).
+  var CANVAS_CACHE_BYTES = 24 * 1024 * 1024;
+  var canvasCache = { map: {}, bytes: 0, sizes: {}, uses: {}, count: 0, stamp: 0 };
   function cacheGet(key) {
     var c = canvasCache.map[key];
     if (c === undefined) return undefined;
-    var idx = canvasCache.order.indexOf(key);
-    if (idx >= 0 && idx < canvasCache.order.length - 1) { canvasCache.order.splice(idx, 1); canvasCache.order.push(key); }
+    canvasCache.uses[key] = ++canvasCache.stamp;
     return c;
   }
   function cachePut(key, canvas) {
+    var cc = canvasCache;
     var bytes = (canvas.width || 0) * (canvas.height || 0) * 4;
-    if (canvasCache.map[key] !== undefined) {
-      canvasCache.bytes -= canvasCache.sizes[key] || 0;
-      canvasCache.order.splice(canvasCache.order.indexOf(key), 1);
-    }
-    canvasCache.order.push(key);
-    canvasCache.map[key] = canvas;
-    canvasCache.sizes[key] = bytes;
-    canvasCache.bytes += bytes;
-    // evict least recently used until under the byte budget (never the canvas just stored)
-    while (canvasCache.bytes > CANVAS_CACHE_BYTES && canvasCache.order.length > 1) {
-      var old = canvasCache.order.shift();
-      canvasCache.bytes -= canvasCache.sizes[old] || 0;
-      delete canvasCache.map[old]; delete canvasCache.sizes[old];
-    }
+    if (cc.map[key] !== undefined) cc.bytes -= cc.sizes[key] || 0;
+    else cc.count++;
+    cc.map[key] = canvas; cc.sizes[key] = bytes; cc.uses[key] = ++cc.stamp; cc.bytes += bytes;
+    if (cc.bytes > CANVAS_CACHE_BYTES) cacheTrim(key);
     return canvas;
   }
-  function clearCanvasCache() { canvasCache = { map: {}, order: [], bytes: 0, sizes: {} }; }
+  function cacheTrim(keep) {
+    var cc = canvasCache, keys = Object.keys(cc.uses), i = 0;
+    keys = keys.filter(function (k) { return k !== keep; });
+    keys.sort(function (x, y) { return cc.uses[x] - cc.uses[y]; });
+    var target = CANVAS_CACHE_BYTES * 0.75;
+    while (cc.bytes > target && i < keys.length) {
+      var old = keys[i++];
+      cc.bytes -= cc.sizes[old] || 0;
+      delete cc.map[old]; delete cc.sizes[old]; delete cc.uses[old]; cc.count--;
+    }
+  }
+  function clearCanvasCache() { canvasCache = { map: {}, bytes: 0, sizes: {}, uses: {}, count: 0, stamp: 0 }; }
 
   // Drops every image and derived canvas that was built lazily (sprite atlases, ground/background
   // textures, tint and flip canvases, child caches) so the next frame re-requests them fresh.
@@ -923,6 +1253,7 @@
     return ASSET_EPOCH;
   }
   function texImage(file) {
+    if (window.RR_TIER === 'none') { TEX_IMG[file] = null; return null; }
     if (TEX_IMG[file] !== undefined) return TEX_IMG[file];
     var im = new Image();
     if (typeof Image !== 'undefined') {
@@ -1095,6 +1426,7 @@
   var ASSET_EPOCH = 0;
   function assetUrl(path) { return ASSET_EPOCH ? path + '?r=' + ASSET_EPOCH : path; }
   function sheetImage(si) {
+    if (window.RR_TIER === 'none') return null;          // no assets: callers use their shape fallback
     if (!SHEET_IMGS[si]) {
       var im = new Image();
       im.onload = function () { dirty = true; clearCanvasCache(); };  // drop tint canvases made before this atlas was ready
@@ -1157,8 +1489,10 @@
   }
   function drawAtlasCrop(g, f, src, x, y, sx, sy) {
     var fsc = f[10] || 1;   // SD-tier sheets: source pixels are half the logical (HD) size
-    if (src) g.drawImage(src, 0, 0, f[3], f[4], x, y, f[3] * fsc * sx, f[4] * fsc * sy);
-    else g.drawImage(SHEET_IMGS[f[0]], f[1], f[2], f[3], f[4], x, y, f[3] * fsc * sx, f[4] * fsc * sy);
+    var fsy = f[11] || fsc; // vertical scale (SD frames whose aspect differs from High by rounding)
+    var fsy = f[11] || fsc;
+    if (src) g.drawImage(src, 0, 0, f[3], f[4], x, y, f[3] * fsc * sx, f[4] * fsy * sy);
+    else g.drawImage(SHEET_IMGS[f[0]], f[1], f[2], f[3], f[4], x, y, f[3] * fsc * sx, f[4] * fsy * sy);
   }
 
   // A packed atlas frame is often only the trimmed visible portion of a larger sprite.
@@ -1169,7 +1503,7 @@
     // centre of the trimmed frame relative to the untrimmed source centre (both axes, same convention),
     // so front and back halves of a portal land on the same oval
     var fsc = f[10] || 1;
-    var lw = f[3] * fsc, lh = f[4] * fsc;          // logical (HD-unit) size; source pixels may be smaller
+    var lw = f[3] * fsc, lh = f[4] * (f[11] || fsc); // logical (HD-unit) size; source pixels may be smaller
     var sw = f[7] || lw, sh = f[8] || lh;
     var tx = f[5] || 0, ty = f[6] || 0;
     return {
@@ -1301,13 +1635,13 @@
 
   function drawSpriteObj(g, toS, o, x0, y1, alpha, rotationExtra, pulseTint) {
     if (MONO) return false;
-    var kind = LevelModel.kindOf(o.id);
+    var kind = kindFast(o);
     var name = frameForObject(o);
     var kidList = typeof OBJ_CHILDREN !== 'undefined' ? OBJ_CHILDREN[o.id] : null;
     // reference v2.0: objects whose main frame is "none"/"emptyFrame" (or whose frame is not
     // in the atlas, e.g. the "noen" typo) render through their children only — no fallback box
     if ((!name || !FRAMES[name] || !FRAMES[name][3] || !FRAMES[name][4]) && kidList && kidList.length) {
-      var fp0 = LevelModel.footprint(o);
+      var fp0 = footFast(o);
       var ccx = x0 + fp0.w * CELL / 2, ccy = y1 - fp0.h * CELL / 2;
       var C0 = toS(ccx, ccy), O0 = toS(ccx + 1, ccy + 1);
       var kx0 = Math.abs(O0.x - C0.x), ky0 = Math.abs(O0.y - C0.y);
@@ -1339,7 +1673,7 @@
     var f = FRAMES[name];
     if (f[9] || !sheetImage(f[0])) return false;     // rotated atlas frames and unloaded sheets use the fallback
     var u = SPRITE_UNIT;
-    var fp = LevelModel.footprint(o);
+    var fp = footFast(o);
     var cx = x0 + fp.w * CELL / 2, cy = y1 - fp.h * CELL / 2;      // object centre, world units
     // The level object's x/y is the authored sprite origin. Preserve the trimmed
     // atlas frame's source-size offset in that local coordinate space before rotation.
@@ -1529,7 +1863,7 @@
 
   // GD 2.2 text object (914): the k31 string centred on the object, tinted via its colour channel
   function drawTextObj(g, toS, o, rotationExtra, pulseTint) {
-    var fp = LevelModel.footprint(o);
+    var fp = footFast(o);
     var cx = o.gx * 30 + fp.w * 30 / 2, cy = o.gy * 30 + fp.h * 30 / 2;
     var size = Math.max(6, Math.round(18 * (o.scale || 1)));
     var C = toS(cx, cy);
@@ -1562,15 +1896,21 @@
     for (var oi = 0; oi < objs.length; oi++) {
       var o = objs[oi];
       if (o.broken) continue;
-      var kind = LevelModel.kindOf(o.id);
+      var kind = kindFast(o);
       if (kind === 'trigger' || kind === 'fx') continue;
+      if (live && o.hidden) continue;          // reference key 135: the sprite is hidden during play
       if (live && PLAY_HIDDEN[o.id]) continue;      // reference: editor-only dblock sprites are hidden during play
       var inf = live ? (o.groups ? groupInfo(o.groups) : DEFAULT_INF) : null;
       if (inf && inf.hidden) continue;
       // reference _applyChannelAlpha: channel opacity applies as sprite alpha
       g.globalAlpha = (inf ? inf.alpha : 1) * (live && canColor(o.id) ? channelAlphaOf(o.col || defChannel(o.id)) : 1);
-      var fp = LevelModel.footprint(o);
+      var fp = footFast(o);
       var x0 = o.gx * CELL + (inf ? inf.dx : 0), y0 = o.gy * CELL + (inf ? inf.dy : 0), x1 = x0 + fp.w * CELL, y1 = y0 + fp.h * CELL;
+      if (o.sx || o.sy) {
+        var scCx = (x0 + x1) / 2, scCy = (y0 + y1) / 2;
+        var scHw = (x1 - x0) / 2 * (o.sx || 1), scHh = (y1 - y0) / 2 * (o.sy || 1);
+        x0 = scCx - scHw; x1 = scCx + scHw; y0 = scCy - scHh; y1 = scCy + scHh;
+      }
       var rotationExtra = inf && (!inf.centerGroup || inf.pivot) && (!inf.centerGroup || !inf.lockRotation) ? inf.rotation : 0;
       if (inf && inf.rotation && inf.centerGroup > 0 && inf.pivot) {
         var ocx = x0 + fp.w * CELL / 2, ocy = y0 + fp.h * CELL / 2;
@@ -1582,8 +1922,8 @@
       }
       var pulseTint = inf ? inf.pulseTint : null;
       // cheap horizontal cull before any allocation (the play view maps x as CENTER_X + 2*(x - p.x))
-      if (live) {
-        var cx0 = CENTER_X + 2 * (x0 - p.x), cx1 = CENTER_X + 2 * (x1 - p.x);
+      if (live && !sidewaysNow()) {
+        var cx0 = CENTER_X + 2 * camZoom * (x0 - camWorldX - camOffX), cx1 = CENTER_X + 2 * camZoom * (x1 - camWorldX - camOffX);
         var cmp = mirrorProgress();
         if (cmp > 0) {
           // mirror-mapped positions: the reflection can pull far-side objects into view mid-flip
@@ -1758,7 +2098,7 @@
   function defZOrder(id) { var d = typeof OBJ_ZDEFAULTS !== 'undefined' ? OBJ_ZDEFAULTS[id] : null; return d ? d[1] : 0; }
   var RENDER_LAYER_DEPTH = { '-5': -12, '-3': -9, '-1': -6, '0': 0, '1': 3, '3': 6, '5': 9, '7': 10.5, '9': 12, '11': 13.5 };
   function objectRenderDepth(o) {
-    var isText = LevelModel.kindOf(o.id) === 'text';
+    var isText = kindFast(o) === 'text';
     var layer = o.zLayer || (typeof defZLayer === 'function' ? defZLayer(o.id) : (isText ? 3 : 0));
     var order = o.zOrder || (typeof defZOrder === 'function' ? defZOrder(o.id) : 0);
     return (RENDER_LAYER_DEPTH[layer] !== undefined ? RENDER_LAYER_DEPTH[layer] : 0) + order * 0.01;
@@ -1774,6 +2114,7 @@
       var o = src[i];
       o._renderIndex = i;
       o._renderDepth = objectRenderDepth(o);
+      o._renderKey = Math.round((o._renderDepth + 1000) * 100) * 16777216 + i;
       if (o.groups && o.groups.length) OBJ_GROUPED_X.push(o);
       else OBJ_STATIC_X.push(o);
     }
@@ -1798,6 +2139,27 @@
     var i = lowerBoundGX(arr, lo);
     while (i < arr.length && arr[i].gx <= hi) out.push(arr[i++]);
   }
+  // per-object kind and footprint are fixed for an object: cache them on first use (draw path)
+  function kindFast(o) {
+    var k = o._k;
+    if (k === undefined) { k = LevelModel.kindOf(o.id); o._k = k === null ? '' : k; }
+    return k === '' ? null : k;
+  }
+  function footFast(o) {
+    var f0 = o._f;
+    if (f0 === undefined) { f0 = LevelModel.footprint(o); o._f = f0; }
+    return f0;
+  }
+  var KEY_SCRATCH = new Float64Array(2048);
+  function sortByRenderKey(arr) {
+    var n = arr.length, i;
+    if (KEY_SCRATCH.length < n) KEY_SCRATCH = new Float64Array(n * 2);
+    for (i = 0; i < n; i++) KEY_SCRATCH[i] = arr[i]._renderKey;
+    var sub = KEY_SCRATCH.subarray(0, n);
+    sub.sort();
+    for (i = 0; i < n; i++) arr[i] = LEVEL.objs[sub[i] % 16777216];
+    return arr;
+  }
   function visibleObjs(playerX) {
     ensureRenderIndexes();
     VISIBLE_BUFFER.length = 0;
@@ -1813,9 +2175,7 @@
     appendGXRange(OBJ_GROUPED_X, groupLo, groupHi, VISIBLE_BUFFER);
     // Stable tie-break preserves source order for objects with identical depth.
     // Reusing this array avoids a fresh slice/allocation on every animation frame.
-    VISIBLE_BUFFER.sort(function (a, b) {
-      return a._renderDepth - b._renderDepth || a._renderIndex - b._renderIndex;
-    });
+    sortByRenderKey(VISIBLE_BUFFER);
     return VISIBLE_BUFFER;
   }
   function allRenderOrder() {
@@ -1835,8 +2195,8 @@
     if (!f || f[9] || !sheetImage(f[0])) return false;
     // the icons atlas is 1x: one atlas pixel = one world unit (the cube frame is 60px = the
     // 30-unit hitbox box drawn at the 2px/unit play scale) — unlike the hd level sheets (0.5)
-    var fsc = f[10] || 1;
-    var dw = f[3] * fsc * k, dh = f[4] * fsc * k;
+    var fsc = f[10] || 1, fsy = f[11] || fsc;
+    var dw = f[3] * fsc * k, dh = f[4] * fsy * k;
     var dx = (f[5] - f[7] / 2) * k, dy = (f[6] - f[8] / 2) * k + (oy || 0);
     var tc = tint ? frameTint(name, f, tint) : null;
     if (tc) g.drawImage(tc, 0, 0, f[3], f[4], dx, dy, dw, dh);
@@ -1905,7 +2265,8 @@
       if (L.rot) g.rotate(L.rot);
       g.scale(L.sx * (L.fx ? -1 : 1), L.sy * (L.fy ? -1 : 1));
       var fsc2 = f[10] || 1;
-      var dw = f[3] * fsc2 * k, dh = f[4] * fsc2 * k, dx = (f[5] - f[7] / 2) * k, dy = (f[6] - f[8] / 2) * k;
+      var fsy2 = f[11] || fsc2;
+      var dw = f[3] * fsc2 * k, dh = f[4] * fsy2 * k, dx = (f[5] - f[7] / 2) * k, dy = (f[6] - f[8] / 2) * k;
       var tc = L.tint ? frameTint(L.tex, f, L.tint) : null;
       if (tc) g.drawImage(tc, 0, 0, f[3], f[4], dx, dy, dw, dh);
       else g.drawImage(sheetImage(f[0]), f[1], f[2], f[3], f[4], dx, dy, dw, dh);
@@ -1947,7 +2308,7 @@
     var key = beastFrameKey(o, d);
     var sprites = key ? d.frames[key] : null;
     if (!sprites) return false;
-    var fp = LevelModel.footprint(o);
+    var fp = footFast(o);
     var ccx = x0 + fp.w * CELL / 2, ccy = y1 - fp.h * CELL / 2;
     var C = toS(ccx, ccy), O = toS(ccx + 1, ccy + 1);
     var kx = Math.abs(O.x - C.x), ky = Math.abs(O.y - C.y);
@@ -2072,62 +2433,67 @@
       g.restore();
       return;
     }
-    // vector fallback when the icon sheet has not loaded
+    // vector fallback when the icon sheet has not loaded: a white body with a black border
+    // (player 2 is the inverse: black body, white border, so the two stay distinguishable)
     g.save();
     g.translate(c.x, c.y);
     g.rotate(pl.mirrored ? -pl.rot : pl.rot);
     if (pl.flip) g.scale(1, -1);
     if (pl.mirrored) g.scale(-1, 1);
     var fg = invert ? '#fff' : '#000', bg = invert ? '#000' : '#fff';
-    g.fillStyle = fg;
+    var edgeCol = fg, lw = Math.max(2, h * 0.12);
+    // fill the body with the body colour, then outline the same path in the border colour
+    function body(pathFn) {
+      g.beginPath(); pathFn(); g.closePath();
+      g.fillStyle = bg; g.fill();
+      g.strokeStyle = edgeCol; g.lineWidth = lw; g.stroke();
+    }
+    function ellipsePath(rx, ry) { g.ellipse(0, 0, rx, ry, 0, 0, Math.PI * 2); }
     if (pl.mode === 'cube') {
-      g.fillRect(-h, -h, h * 2, h * 2);
-      g.fillStyle = bg; g.fillRect(-h + 5, -h + 5, h * 2 - 10, h * 2 - 10);
+      body(function () { g.rect(-h, -h, h * 2, h * 2); });
       g.fillStyle = fg; g.fillRect(-3, -3, 6, 6);
     } else if (pl.mode === 'ball') {
-      g.beginPath(); g.arc(0, 0, h, 0, Math.PI * 2); g.fill();
-      g.strokeStyle = bg; g.lineWidth = 3;
+      body(function () { g.arc(0, 0, h, 0, Math.PI * 2); });
+      g.strokeStyle = fg; g.lineWidth = Math.max(2, h * 0.1);
       g.beginPath(); g.moveTo(-h * 0.6, 0); g.lineTo(h * 0.6, 0); g.stroke();
     } else if (pl.mode === 'ufo') {
-      g.beginPath(); g.ellipse(0, 0, h, h * 0.6, 0, 0, Math.PI * 2); g.fill();
-      g.fillStyle = bg;
-      g.beginPath(); g.ellipse(0, -h * 0.1, h * 0.45, h * 0.25, 0, 0, Math.PI * 2); g.fill();
+      body(function () { ellipsePath(h, h * 0.6); });
+      g.strokeStyle = fg; g.lineWidth = Math.max(1.5, h * 0.08);
+      g.beginPath(); ellipsePath(h * 0.45, h * 0.25); g.stroke();
     } else if (pl.mode === 'ship') {
-      g.beginPath();
-      g.moveTo(h * 1.1, 0); g.lineTo(-h * 0.8, -h * 0.7); g.lineTo(-h * 0.5, 0); g.lineTo(-h * 0.8, h * 0.7);
-      g.closePath(); g.fill();
+      body(function () {
+        g.moveTo(h * 1.1, 0); g.lineTo(-h * 0.8, -h * 0.7); g.lineTo(-h * 0.5, 0); g.lineTo(-h * 0.8, h * 0.7);
+      });
     } else if (pl.mode === 'wave') {
-      g.beginPath();
-      g.moveTo(h * 0.8, 0); g.lineTo(-h * 0.6, -h * 0.5); g.lineTo(-h * 0.6, h * 0.5);
-      g.closePath(); g.fill();
+      body(function () { g.moveTo(h * 0.8, 0); g.lineTo(-h * 0.6, -h * 0.5); g.lineTo(-h * 0.6, h * 0.5); });
     } else if (pl.mode === 'robot') {
-      g.fillRect(-h * 0.7, -h * 0.2, h * 1.4, h * 1.2);
-      g.fillStyle = bg; g.fillRect(-h * 0.45, -h * 0.05, h * 0.9, h * 0.4);
-      g.fillStyle = fg; g.fillRect(-h * 0.5, h * 0.4, h * 0.35, h * 0.6); g.fillRect(h * 0.15, h * 0.4, h * 0.35, h * 0.6);
+      body(function () { g.rect(-h * 0.7, -h * 0.2, h * 1.4, h * 1.2); });
+      body(function () { g.rect(-h * 0.5, h * 0.4, h * 0.35, h * 0.6); });
+      body(function () { g.rect(h * 0.15, h * 0.4, h * 0.35, h * 0.6); });
+      g.strokeStyle = fg; g.lineWidth = Math.max(1.5, h * 0.08);
+      g.beginPath(); g.rect(-h * 0.45, -h * 0.05, h * 0.9, h * 0.4); g.stroke();
     } else if (pl.mode === 'swing') {
-      g.beginPath();
-      g.moveTo(0, -h * 0.9); g.lineTo(h * 0.9, 0); g.lineTo(0, h * 0.9); g.lineTo(-h * 0.9, 0);
-      g.closePath(); g.fill();
-      g.fillStyle = bg; g.beginPath(); g.arc(0, 0, h * 0.25, 0, Math.PI * 2); g.fill();
+      body(function () { g.moveTo(0, -h * 0.9); g.lineTo(h * 0.9, 0); g.lineTo(0, h * 0.9); g.lineTo(-h * 0.9, 0); });
+      g.fillStyle = fg; g.beginPath(); g.arc(0, 0, h * 0.2, 0, Math.PI * 2); g.fill();
     } else if (pl.mode === 'spider') {
-      g.beginPath(); g.arc(0, 0, h * 0.7, 0, Math.PI * 2); g.fill();
-      g.strokeStyle = fg; g.lineWidth = 3;
+      g.strokeStyle = fg; g.lineWidth = Math.max(2, h * 0.1);
       for (var k = -1; k <= 1; k += 2) {
         g.beginPath(); g.moveTo(k * h * 0.5, -h * 0.3); g.lineTo(k * h * 1.2, -h * 0.9); g.stroke();
         g.beginPath(); g.moveTo(k * h * 0.5, h * 0.3); g.lineTo(k * h * 1.2, h * 0.9); g.stroke();
       }
+      body(function () { g.arc(0, 0, h * 0.7, 0, Math.PI * 2); });
     }
     g.restore();
   }
 
   // ---- play rendering ----
   function playToS(x1, y1) {
-    var sx = CENTER_X + 2 * (x1 - p.x);
+    var sx = CENTER_X + 2 * camZoom * (x1 - camWorldX - camOffX);
     // reference mirror: x' = x + p * (screenWidth - 2x) — the world reflects around the screen
     // centre while the flip animates and stays fully reflected at rest (container scaleX -1)
     var mp = mirrorProgress();
     if (mp > 0) sx += mp * (CW - 2 * sx);
-    return { x: sx, y: playCamY + GROUND_SY - 2 * y1 };
+    return { x: sx, y: playCamY + GROUND_SY - 2 * camZoom * y1 + 2 * camOffY };
   }
   // push settings into the sim and the toggle buttons, then redraw
   function setSettingButton(id, on, label) {
@@ -2187,7 +2553,25 @@
     ctx.setLineDash([]); ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
   }
 
+  // sideways view: the reference maps (gameY, C - frameX) on the screen, a reflection across the diagonal
+  function sidewaysNow() { var q = playerNow(); return !!(q && q.sideways); }
+  function reflectAbout(g, cx, cy) { g.translate(cx, cy); g.transform(0, -1, -1, 0, 0, 0); g.translate(-cx, -cy); }
+  // the cube is counter-reflected so it reads upright (its own rotation is applied inside)
+  function drawPlayerView(g, toS, s, pl, invert) {
+    if (!pl.sideways) { drawPlayer(g, toS, s, pl, invert); return; }
+    var c = toS(pl.x, pl.y);
+    g.save(); reflectAbout(g, c.x, c.y);
+    drawPlayer(g, toS, s, pl, invert);
+    g.restore();
+  }
   function renderPlay() {
+    ctx.save();
+    if (sidewaysNow()) reflectAbout(ctx, CW / 2, CH / 2);
+    if (camAngle) { ctx.translate(CW / 2, CH / 2); ctx.rotate(camAngle * Math.PI / 180); ctx.translate(-CW / 2, -CH / 2); }
+    renderPlayInner();
+    ctx.restore();
+  }
+  function renderPlayInner() {
     var drewTex = false;
     if (!MONO && LEVEL.bgId) {
       var m = bgMirrorCanvas(bgFileOf(LEVEL));
@@ -2200,8 +2584,8 @@
     }
     if (!drewTex) { ctx.fillStyle = bgColor(); ctx.fillRect(0, 0, CW, CH); }
     drawWorld(ctx, playToS, 2, true);
-    drawPlayer(ctx, playToS, 2, p, false);
-    if (p2) drawPlayer(ctx, playToS, 2, p2, true);
+    drawPlayerView(ctx, playToS, 2, p, false);
+    if (p2) drawPlayerView(ctx, playToS, 2, p2, true);
     if (showHitboxes) drawHitboxes(LEVEL.sim());
     ctx.fillStyle = '#000';
     ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
@@ -2266,7 +2650,10 @@
     { label: 'Hide', id: 1049, p: { activate: 0, dur: 1 } }, { label: 'Show', id: 1049, p: { activate: 1, dur: 1 } },
     { label: 'Fade 50', id: 1007, p: { opacity: 0.5, dur: 1 } },
     { label: 'Move up', id: 901, p: { dx: 0, dy: 60, dur: 1 } }, { label: 'Move down', id: 901, p: { dx: 0, dy: -60, dur: 1 } },
-    { label: 'Move right', id: 901, p: { dx: 60, dy: 0, dur: 1 } }, { label: 'Stop', id: 1616, p: { dur: 1 } }, { label: 'Spawn', id: 1268, p: { delay: 0 } }
+    { label: 'Move right', id: 901, p: { dx: 60, dy: 0, dur: 1 } }, { label: 'Stop', id: 1616, p: { dur: 1 } }, { label: 'Spawn', id: 1268, p: { delay: 0 } }, { label: 'Zoom 2x', id: 1913, p: { zoom: 2, dur: 1 } }, { label: 'Zoom 1x', id: 1913, p: { zoom: 1, dur: 1 } }, { label: 'Cam up', id: 1916, p: { dx: 0, dy: 60, dur: 1, axis: 0 } }, { label: 'Cam down', id: 1916, p: { dx: 0, dy: -60, dur: 1, axis: 0 } }, { label: 'Static cam', id: 1914, p: { target: 0, exit: false, dur: 0 } }, { label: 'Static exit', id: 1914, p: { target: 0, exit: true, dur: 0 } }, { label: 'Rot flip', id: 2900, p: { ground: 4, move: 4, touch: true } }, { label: 'Rot reverse', id: 2900, p: { ground: 2, move: 2, touch: true } }, { label: 'Rot normal', id: 2900, p: { ground: 2, move: 4, touch: true } }, { label: 'Rot sideways', id: 2900, p: { ground: 3, move: 4, touch: true } }, { label: 'Cam rot 90', id: 2015, p: { degrees: 90, add: false, dur: 1 } },
+    { label: 'Reverse', id: 1917, p: {} }, { label: 'Gravity 1.5x', id: 2066, p: { gravity: 1.5 } },
+    { label: 'Stop jump', id: 1932, p: { stopJump: true } }, { label: 'Timewarp 1.5x', id: 1935, p: { timeMod: 1.5 } },
+    { label: 'Teleport to Group 1', id: 3022, p: { target: 1, gravityMode: 0 } }, { label: 'End level', id: 3600, p: {} }
   ];
   var toolIndex = 2, flipNext = false, flipYNext = false;
   var editCam = { x: 150, y: 60 }, zoom = 1;
@@ -2468,15 +2855,36 @@
     drawWorld(ectx, editToS, s, false);
     ectx.globalAlpha = 1;
     LEVEL.objs.forEach(function (o) {
-      var kind = LevelModel.kindOf(o.id), fp = LevelModel.footprint(o);
+      var kind = kindFast(o), fp = footFast(o);
       var a = editToS(o.gx * CELL, (o.gy + fp.h) * CELL), b = editToS((o.gx + fp.w) * CELL, o.gy * CELL);
       if (kind === 'trigger') {
         var t = o.p || {};
-        var lbl = o.id === 1049 ? (t.activate ? 'S' : 'H') : o.id === 1007 ? 'A' : o.id === 901 ? 'M' : 'X';
+        var triggerLabels = { 1913: 'ZOOM', 1914: 'STATIC', 1916: 'OFFSET', 1917: 'REV', 1932: 'CTRL', 1935: 'TIME', 2015: 'CAM R', 2062: 'EDGE', 2066: 'GRAV', 2900: 'ROT', 2925: 'MODE', 3022: 'TP', 3600: 'END', 3604: 'EVENT' };
+        var lbl = o.id === 1049 ? (t.activate ? 'S' : 'H') : o.id === 1007 ? 'A' : o.id === 901 ? 'M' : (triggerLabels[o.id] || 'X');
         ectx.fillStyle = '#fff'; ectx.fillRect(a.x, a.y, b.x - a.x, b.y - a.y);
         ectx.strokeStyle = '#000'; ectx.lineWidth = 2; ectx.strokeRect(a.x + 2, a.y + 2, b.x - a.x - 4, b.y - a.y - 4);
-        ectx.fillStyle = '#000'; ectx.font = 'bold 14px Arial, sans-serif'; ectx.textAlign = 'center'; ectx.textBaseline = 'middle';
-        ectx.fillText(lbl + (t.touch ? '*' : '') + (t.target || ''), (a.x + b.x) / 2, (a.y + b.y) / 2);
+        ectx.fillStyle = '#000'; ectx.font = 'bold 11px Arial, sans-serif'; ectx.textAlign = 'center'; ectx.textBaseline = 'middle';
+        var detail = o.id === 2062 ? (t.edge || '') : o.id === 3604 ? (t.events && t.events.length ? t.events.join('.') : '') : (t.target || '');
+        ectx.fillText(lbl + (t.touch ? '*' : '') + (detail ? ' ' + detail : ''), (a.x + b.x) / 2, (a.y + b.y) / 2);
+      } else if (o.id === 2016) {
+        // Camera Guide is an editor preview only. The orange outline represents the
+        // current aspect ratio; the green inset is the minimum 4:3 safe frame.
+        var gp = o.p || {}, guideZoom = Math.max(0.4, Math.min(3, Number(gp.zoom) || 1));
+        var guideCx = o.gx * CELL + fp.w * CELL / 2 + (Number(gp.dx) || 0);
+        var guideCy = o.gy * CELL + fp.h * CELL / 2 + (Number(gp.dy) || 0);
+        var halfH = CH / (4 * guideZoom), halfW = CW / (4 * guideZoom);
+        var ga = editToS(guideCx - halfW, guideCy + halfH), gb = editToS(guideCx + halfW, guideCy - halfH);
+        var minHalfW = halfH * 4 / 3;
+        var g4a = editToS(guideCx - minHalfW, guideCy + halfH), g4b = editToS(guideCx + minHalfW, guideCy - halfH);
+        ectx.save(); ectx.globalAlpha = gp.previewOpacity === undefined ? 0.85 : Math.max(0, Math.min(1, Number(gp.previewOpacity)));
+        ectx.setLineDash([8, 5]); ectx.lineWidth = 2; ectx.strokeStyle = '#d88a20';
+        ectx.strokeRect(ga.x, ga.y, gb.x - ga.x, gb.y - ga.y);
+        ectx.setLineDash([4, 4]); ectx.strokeStyle = '#299b55';
+        ectx.strokeRect(g4a.x, g4a.y, g4b.x - g4a.x, g4b.y - g4a.y);
+        var gc = editToS(guideCx, guideCy); ectx.setLineDash([]); ectx.strokeStyle = '#d6a400';
+        ectx.beginPath(); ectx.moveTo(gc.x - 7, gc.y); ectx.lineTo(gc.x + 7, gc.y); ectx.moveTo(gc.x, gc.y - 7); ectx.lineTo(gc.x, gc.y + 7); ectx.stroke();
+        ectx.fillStyle = '#6b4b00'; ectx.font = 'bold 11px Arial, sans-serif'; ectx.textAlign = 'left'; ectx.textBaseline = 'bottom';
+        ectx.fillText('CAMERA GUIDE  x' + guideZoom.toFixed(2), ga.x + 3, ga.y - 3); ectx.restore();
       } else if (o.groups && o.groups.length) {
         ectx.fillStyle = '#000'; ectx.font = 'bold 11px Arial, sans-serif'; ectx.textAlign = 'left'; ectx.textBaseline = 'top';
         ectx.fillText(o.groups.join('.'), a.x + 2, b.y + 1);
@@ -2488,7 +2896,7 @@
     ectx.strokeRect(sp1.x, sp1.y, sp2.x - sp1.x, sp2.y - sp1.y); ectx.setLineDash([]);
     // selection outlines
     selection.forEach(function (o) {
-      var fp = LevelModel.footprint(o);
+      var fp = footFast(o);
       var a = editToS(o.gx * CELL, (o.gy + fp.h) * CELL), b = editToS((o.gx + fp.w) * CELL, o.gy * CELL);
       ectx.strokeStyle = '#000'; ectx.lineWidth = 3; ectx.setLineDash([4, 3]);
       ectx.strokeRect(a.x - 3, a.y - 3, b.x - a.x + 6, b.y - a.y + 6); ectx.setLineDash([]);
@@ -2530,10 +2938,11 @@
       var res = LevelModel.importText(text, { convertDeco: !!(document.getElementById('deco-convert') && document.getElementById('deco-convert').checked) });
       LEVEL = res.level;
       levelIsDefault = false;
+      syncPlatformerUI();
       clearSelection(); undoStack = []; redoStack = [];
       var skippedIds = Object.keys(res.skipped);
       flash('Loaded ' + res.level.objs.length + ' objects' + (res.name ? ' from "' + res.name + '"' : '') + (res.converted ? ' (' + res.converted + ' decorations became blocks)' : '') +
-        (skippedIds.length ? '. Skipped unsupported ids: ' + skippedIds.join(', ') : '') + '.');
+        (skippedIds.length ? '. Skipped unsupported ids: ' + skippedIds.join(', ') : '') + '. ' + inertCount() + ' inert triggers (not simulated).');
       dirty = true;
     } catch (e) {
       flash('Import failed: ' + e.message);
@@ -2596,6 +3005,7 @@
     var k = e.keyCode;
     var mod = e.ctrlKey || e.metaKey;
     if (k === 32 && activeTab === 'play') { e.preventDefault(); if (!e.repeat) pressJump(); return; }
+    if (activeTab === 'play' && LEVEL.platformer && (k === 37 || k === 65 || k === 39 || k === 68)) { e.preventDefault(); if (k === 37 || k === 65) leftHeld = true; else rightHeld = true; return; }
     if (activeTab === 'edit') {
       if (mod && k === 90 && !e.shiftKey) { e.preventDefault(); undo(); return; }
       if (mod && (k === 89 || (k === 90 && e.shiftKey))) { e.preventDefault(); redo(); return; }
@@ -2614,6 +3024,8 @@
   document.onkeyup = function (e) {
     var k = e.keyCode;
     if (k === 32) releaseJump();
+    if (k === 37 || k === 65) leftHeld = false;
+    if (k === 39 || k === 68) rightHeld = false;
     if (KEY_PAN[k]) panKeys[KEY_PAN[k]] = false;
   };
 
@@ -2646,6 +3058,14 @@
     mouseMode = 0;
   }
 
+  function syncPlatformerUI() {
+    var enabled = !!(LEVEL && LEVEL.platformer);
+    var toggle = document.getElementById('btn-platformer');
+    var controls = document.getElementById('platformer-controls');
+    if (toggle) { toggle.textContent = 'PLATFORMER: ' + (enabled ? 'ON' : 'OFF'); toggle.setAttribute('aria-pressed', enabled ? 'true' : 'false'); }
+    if (controls) controls.style.display = enabled ? 'flex' : 'none';
+  }
+
   function init() {
     ctx = document.getElementById('game').getContext('2d');
     // the editor's bitmap is allocated only when its tab opens (setEditorBitmap)
@@ -2660,6 +3080,8 @@
     game.addEventListener('touchstart', function (e) { e.preventDefault(); if (activeTab === 'play') pressJump(); }, { passive: false });
     game.addEventListener('touchend', function (e) { e.preventDefault(); releaseJump(); }, { passive: false });
     bind('hold', pressJump, releaseJump);
+    bind('move-left', function () { leftHeld = true; }, function () { leftHeld = false; });
+    bind('move-right', function () { rightHeld = true; }, function () { rightHeld = false; });
 
     var ed = document.getElementById('editor');
     ed.onmousedown = function (e) { beginEditPointer(e.clientX, e.clientY, e.button, e.shiftKey); };
@@ -2685,6 +3107,7 @@
     click('tab-edit', function () { setTab('edit'); });
     click('tab-levels', function () { setTab('levels'); });
     click('btn-play', function () { demoActive = false; resetRun(); status = 'ready'; dirty = true; });
+    click('btn-platformer', function () { LEVEL.platformer = !LEVEL.platformer; LEVEL.touch(); demoActive = false; syncPlatformerUI(); resetRun(); status = 'ready'; dirty = true; flash('Platformer Mode ' + (LEVEL.platformer ? 'enabled' : 'disabled') + '.'); });
     click('btn-demo', startDemo);
     click('btn-level', function () { loadLevel((levelIdx + 1) % LEVELS.length); setTab('play'); });
     click('btn-zoom-in', function () { zoom = Math.min(2.5, zoom * 1.15); dirty = true; });
@@ -2704,15 +3127,18 @@
     // graphics tier: switching reloads the page, because the atlas table is read at startup
     var qb = document.getElementById('set-quality');
     if (qb) {
-      qb.textContent = 'GRAPHICS: ' + (window.RR_TIER === 'hd' ? 'HIGH' : 'LOW');
+      var tierLabel = { sd: 'LOW', hd: 'HIGH', none: 'NONE AT ALL' };
+      qb.textContent = 'GRAPHICS: ' + (tierLabel[window.RR_TIER] || 'LOW');
       qb.onclick = function () {
-        var next = window.RR_TIER === 'hd' ? 'sd' : 'hd';
+        var cycle = { sd: 'hd', hd: 'none', none: 'sd' };
+        var next = cycle[window.RR_TIER] || 'sd';
         try { localStorage.setItem('rr_tier', next); } catch (e) { flash('Graphics setting could not be saved.'); return; }
         location.reload();
       };
     }
     click('set-percent', function () { showPercent = !showPercent; syncSettings(); });
     syncSettings();
+    syncPlatformerUI();
 
     var fileIn = document.getElementById('gmd-file');
     if (fileIn) fileIn.onchange = function () {
@@ -2739,6 +3165,9 @@
       startPlay: function () { resetRun(); status = 'ready'; }, pressJump: pressJump, releaseJump: releaseJump,
       getStatus: function () { return status; }, getPlayer: function () { return p; }, getPlayer2: function () { return p2; },
       groupInfo: function (g) { return groupInfo([g]); }, getGroupState: function () { return groupState; },
+      getVisibleCount: function () { return visibleObjs(p ? p.x : 0).length; },
+      camState: function () { return { zoom: camZoom, offX: camOffX, offY: camOffY, locked: camLocked, camX: camWorldX, camY: playCamY, angle: camAngle, edge: Object.assign({}, cameraEdges), freeMode: freeCameraMode, dirSign: playerNow() ? playerNow().dirSign : 1 }; },
+      emitGameplayEvent: emitGameplayEvent, getCheckpoint: function () { return checkpointState ? Object.assign({}, checkpointState) : null; },
       getLevel: function () { return LEVEL; }, setLevel: function (l) { LEVEL = l; levelIsDefault = false; snapshotPalette(); },
       // test hook: read/park the play camera Y (screen px, reference _cameraY semantics)
       getCamY: function () { return playCamY; }, setCamY: function (v) { playCamY = v; dirty = true; },
@@ -2764,7 +3193,7 @@
           var guard = 0;
           while (guard++ < 20000) {
             frameNo++;
-            processTriggers(); processColourTriggers(); tickTweens();
+            processTriggers(); processColourTriggers(); tickTweens(); tickCamera();
             if (!p || p.dead || p.x >= x) break;
             p.x = Math.min(x, p.x + p.speed * 0.9);
           }

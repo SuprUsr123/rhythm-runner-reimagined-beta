@@ -22,7 +22,7 @@ var LevelModel = (function () {
   // ZainojdafMod's allObjects.js types every one of these as 'trigger' / 'deco'; they have
   // no hitbox, so counting them as supported keeps the official levels free of fake skips.
   var FX = {};
-  [22,23,24,25,26,27,28,29,30,32,33,56,57,58,59,104,105,221,744,899,900,915,1006,1346,1520,1585,1586,1700,1611,1615,1811,1812,3610,3611].forEach(function (id) { FX[id] = true; });
+  [22,23,24,25,26,27,28,29,30,32,33,56,57,58,59,104,105,221,744,899,900,915,1006,1346,1520,1585,1586,1700,1611,1615,1811,1812,2016,3610,3611].forEach(function (id) { FX[id] = true; });
 
   // gamemode / gravity / size / mirror / dual / teleport / spider portal kinds (GD ids).
   // Reference (Web Dashers level.js): object 10 (blue) is portal_gravity_down = normal gravity,
@@ -41,7 +41,7 @@ var LevelModel = (function () {
   var PAD = { 35: true, 140: true, 1332: true, 67: true, 3005: true };
   var ORB = { 36: true, 141: true, 1333: true, 84: true, 1022: true, 1330: true, 1594: true, 1704: true, 1751: true };  // 1704 green dash orb, 1751 blue (gravity-flipping) dash orb
   var COIN = { 142: true, 1329: true };
-  var TRIG = { 1049: 'toggle', 1007: 'alpha', 901: 'move', 1616: 'stop', 1268: 'spawn', 1006: 'pulse', 1346: 'rotate' };
+  var TRIG = { 1049: 'toggle', 1007: 'alpha', 901: 'move', 1616: 'stop', 1268: 'spawn', 1006: 'pulse', 1346: 'rotate', 1913: 'zoom', 1914: 'static', 1916: 'camoffset', 2900: 'rotategp', 2015: 'camrot', 1917: 'reverse', 1932: 'playerControl', 1935: 'timewarp', 2062: 'cameraEdge', 2066: 'gravity', 2925: 'cameraMode', 3022: 'teleport', 3600: 'end', 3604: 'event' };
   // colour triggers (reference level.js LEGACY_COLOR_TRIGGER_CHANNELS): 29 BG, 30 ground,
   // legacy ids carry a default channel; k23 overrides it per instance
   var COL_TRIG = { 29: true, 30: true, 105: true, 221: true, 717: true, 718: true, 743: true, 744: true, 899: true, 900: true, 915: true };
@@ -65,6 +65,74 @@ var LevelModel = (function () {
     }
   });
   var GROUND = { x0: -1e9, x1: 1e9, y0: -1e9, y1: 0 };
+  // Sideways gameplay (reference _swapSidewaysFrame + the transposed collision in getNearbySectionObjects):
+  // the cube runs along world y while gravity and jumps act along world x. The step runs on a copy of the
+  // collision arrays with x and y exchanged (the ground is left out: there is no floor or ceiling).
+  function transposePoint(o) {
+    var t = {}, k;
+    for (k in o) t[k] = o[k];
+    if (o.x0 !== undefined) { t.x0 = o.y0; t.x1 = o.y1; t.y0 = o.x0; t.y1 = o.x1; }
+    if (o.cx !== undefined) { t.cx = o.cy; t.cy = o.cx; }
+    if (o.w !== undefined && o.h !== undefined) { t.w = o.h; t.h = o.w; }
+    if (o.rot !== undefined) t.rot = -o.rot;
+    t.orig = o.orig || o;
+    t._s = 0; t._aff = false;
+    return t;
+  }
+  // Transposed collision copy for sideways gameplay (reference _sidewaysProxy and the sideways branch of
+  // getNearbySectionObjects). Points and boxes exchange x and y, and the rotation is negated. Slopes keep their
+  // direction (a reflection across the diagonal preserves the sign of a slope) and their solid side flips on a
+  // rising slope. A flat slope (solid below its top edge) becomes a full wall block in the transposed frame.
+  // Moving or hidden objects are read from the live list each time it changes, as the reference does.
+  function transposeRec(o) {
+    var t = {}, k;
+    for (k in o) t[k] = o[k];
+    if (o.x0 !== undefined) { t.x0 = o.y0; t.x1 = o.y1; t.y0 = o.x0; t.y1 = o.x1; }
+    if (o.cx !== undefined) { t.cx = o.cy; t.cy = o.cx; }
+    if (o.w !== undefined && o.h !== undefined) { t.w = o.h; t.h = o.w; }
+    if (o.rot !== undefined) t.rot = -o.rot;
+    t.orig = o.orig || o;
+    t._s = 0; t._aff = false;
+    return t;
+  }
+  function transposeSim(lv) {
+    var dyn = lv.dyn || null;
+    if (lv._T && lv._TDyn === dyn) return lv._T;
+    var keys = ['solids', 'spikes', 'portals', 'speeds', 'pads', 'orbs', 'slopes', 'coins'];
+    var T = { solids: [], spikes: [], portals: [], speeds: [], pads: [], orbs: [], slopes: [], coins: [], triggers: lv.triggers || [], dyn: null, dynBase: {} };
+    keys.forEach(function (k) {
+      var sources = [];
+      (lv[k] || []).forEach(function (o) { if (o !== GROUND && !o._aff) sources.push(o); });
+      ((dyn && dyn[k]) || []).forEach(function (o) { sources.push(o); });
+      sources.forEach(function (o) {
+        if (k === 'slopes') {
+          if (o.y0 === o.y1) {
+            // flat: solid below the top edge at y0, spanning x0..x1 -> a wall block at x <= y0 spanning y0..y1
+            var wall = transposeRec(o);
+            wall.x0 = -1e9; wall.x1 = o.y0; wall.y0 = o.x0; wall.y1 = o.x1;
+            wall.dir = undefined; wall.above = undefined;
+            T.solids.push(wall);
+            return;
+          }
+          var A = { x: o.y0, y: o.x0 }, B = { x: o.y1, y: o.x1 };
+          if (A.x > B.x) { var tmp = A; A = B; B = tmp; }
+          var s = transposeRec(o);
+          s.x0 = A.x; s.y0 = A.y; s.x1 = B.x; s.y1 = B.y;
+          s.dir = (B.y - A.y) >= 0 ? 1 : -1;
+          s.above = s.dir > 0 ? !o.above : !!o.above;
+          T.slopes.push(s);
+          return;
+        }
+        T[k].push(transposeRec(o));
+      });
+    });
+    GameSim.buildGrids(T);
+    // buildGrids renumbers the ids; put back the ids of the original records (latches and coin indices use them)
+    keys.forEach(function (k) { T[k].forEach(function (t) { t._id = (t.orig || t)._id; }); });
+    T.dyn = { solids: [], spikes: [], portals: [], speeds: [], pads: [], orbs: [], slopes: [], coins: [] };
+    lv._T = T; lv._TDyn = dyn;
+    return T;
+  }
   var CELL = 30;
   var PORTAL_ROWS = 3;                            // portals are 3 blocks tall
 
@@ -78,6 +146,7 @@ var LevelModel = (function () {
     return k;
   }
   function kindOfRaw(id) {
+    if (id === 2063) return 'checkpoint';
     if (SLOPE[id]) return DECO_SLOPE[id] ? 'decor' : 'slope';
     if (SOLID[id] || defType(id) === 's') return 'solid';
     if (SPIKE[id]) return 'spike';
@@ -177,7 +246,7 @@ var LevelModel = (function () {
   }
 
   // ---- model ----
-  function Level(objs) { this.objs = objs || []; this.dirty = true; this.revision = 0; this._sim = null; }
+  function Level(objs) { this.objs = objs || []; this.dirty = true; this.revision = 0; this._sim = null; this.platformer = false; }
   Level.prototype.touch = function () { this.dirty = true; this.revision++; };
   Level.prototype.covers = function (o, gx, gy) {
     var fp = footprint(o);
@@ -215,7 +284,7 @@ var LevelModel = (function () {
   Level.prototype.clear = function () { this.objs = []; this.touch(); };
   Level.prototype.sim = function () {
     if (!this.dirty && this._sim) return this._sim;
-    var lv = { solids: [GROUND], spikes: [], portals: [], speeds: [], pads: [], orbs: [], slopes: [], coins: [], triggers: [], colourTriggers: [], breakables: [] };
+    var lv = { solids: [GROUND], spikes: [], portals: [], speeds: [], pads: [], orbs: [], slopes: [], coins: [], triggers: [], colourTriggers: [], breakables: [], checkpoints: [] };
     var entries = [], exits = [], maxGx = 0;
     this.objs.forEach(function (o) {
       if (o.gx > maxGx) maxGx = o.gx;                 // the finish line counts every object, broken or not
@@ -228,8 +297,12 @@ var LevelModel = (function () {
         lv.colourTriggers.push({ x0: x0, x1: x1, y0: y0, y1: y1, x: o.gx * CELL + fp.w * CELL / 2, p: o.p, groups: o.groups || [] });
         return;
       }
+      if (kind === 'checkpoint') {
+        lv.checkpoints.push({ id: o.id, x0: x0 + 2, x1: x1 - 2, y0: y0 + 2, y1: y1 - 2, cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, rawProps: o.rawProps || {} });
+        return;
+      }
       if (kind === 'trigger') {
-        lv.triggers.push({ kind: TRIG[o.id], p: o.p || {}, groups: o.groups || [], left: x0, x0: x0 + 6, x1: x0 + CELL - 6, y0: y0 + 6, y1: y0 + CELL - 6 });
+        lv.triggers.push({ kind: TRIG[o.id], id: o.id, p: o.p || {}, groups: o.groups || [], left: x0, x: x0 + fp.w * CELL / 2, y: y0 + fp.h * CELL / 2, x0: x0 + 6, x1: x0 + fp.w * CELL - 6, y0: y0 + 6, y1: y0 + fp.h * CELL - 6 });
         return;
       }
       if (kind === 'fx') return;                     // recognised but inert: nothing to simulate or draw
@@ -240,10 +313,26 @@ var LevelModel = (function () {
       if (kind === 'solid' && BREAKABLE[o.id]) {
         lv.breakables.push({ x0: x0, x1: x1, y0: y0, y1: y1, ref: o });
       } else if (kind === 'solid') {
-        L.solids.push({ x0: x0, x1: x1, y0: y0, y1: y1 });
+        if (o.noTouch) { /* reference: no collider */ }
+        else if (o.rot && (((o.rot % 90) + 90) % 90) !== 0) {
+          // rotated solid (reference Collider with rotation): an oriented box; the axis-aligned bounds feed the grid
+          var rcx = x0 + fp.w * CELL / 2, rcy = y0 + fp.h * CELL / 2;
+          var rw = fp.w * CELL * (o.sx || 1), rh = fp.h * CELL * (o.sy || 1);
+          var rrad = o.rot * Math.PI / 180, rcs = Math.abs(Math.cos(rrad)), rsn = Math.abs(Math.sin(rrad));
+          var rex = (rw * rcs + rh * rsn) / 2, rey = (rw * rsn + rh * rcs) / 2;
+          L.solids.push({ x0: rcx - rex, x1: rcx + rex, y0: rcy - rey, y1: rcy + rey, cx: rcx, cy: rcy, w: rw, h: rh, rot: o.rot, rotSolid: true });
+        }
+        else if (o.sx || o.sy) {
+          var scx = x0 + fp.w * CELL / 2, scy = y0 + fp.h * CELL / 2;
+          var sw = fp.w * CELL * (o.sx || 1) / 2, sh = fp.h * CELL * (o.sy || 1) / 2;
+          if (((((o.rot || 0) % 180) + 180) % 180) === 90) { var swT = sw; sw = sh; sh = swT; }   // a quarter turn swaps the box
+          L.solids.push({ x0: scx - sw, x1: scx + sw, y0: scy - sh, y1: scy + sh });
+        } else L.solids.push({ x0: x0, x1: x1, y0: y0, y1: y1 });
       } else if (kind === 'spike' || kind === 'hazard') {
         // reference hitbox: centred on the object centre; [fullW, fullH] box or a circle radius
         var bx = HBOX.hb[o.id] || [6, 12];
+        var hsx = o.sx || 1, hsy = o.sy || 1;
+        if (bx.r !== undefined) bx = { r: bx.r * (hsx + hsy) / 2 }; else bx = [bx[0] * hsx, bx[1] * hsy];
         var hx = x0 + fp.w * CELL / 2, hy = y0 + fp.h * CELL / 2;
         if (bx.r !== undefined) L.spikes.push({ cx: hx, cy: hy, r: bx.r, rot: o.rot || 0 });
         else L.spikes.push({ x0: hx - bx[0] / 2, x1: hx + bx[0] / 2, y0: hy - bx[1] / 2, y1: hy + bx[1] / 2, cx: hx, cy: hy, w: bx[0], h: bx[1], rot: o.rot || 0 });
@@ -346,20 +435,52 @@ var LevelModel = (function () {
       if (o.p && TRIG[o.id]) {
         var p = o.p, t = TRIG[o.id];
         s += ',51,' + (p.target || 0) + ',10,' + (p.dur === undefined ? 0 : p.dur);
-        if (t === 'move') s += ',28,' + (p.dx || 0) + ',29,' + (p.dy || 0) + ',30,' + (p.easingType || 0) + ',85,' + (p.easingRate === undefined ? 2 : p.easingRate);
+        if (t === 'move' || t === 'camoffset') s += ',28,' + (p.dx || 0) + ',29,' + (p.dy || 0) + ',30,' + (p.easingType || 0) + ',85,' + (p.easingRate === undefined ? 2 : p.easingRate);
         if (t === 'alpha') s += ',35,' + (p.opacity === undefined ? 1 : p.opacity) + ',30,' + (p.easingType || 0) + ',85,' + (p.easingRate === undefined ? 2 : p.easingRate);
         if (t === 'toggle') s += ',56,' + (p.activate ? 1 : 0);
         if (t === 'spawn') s += ',63,' + (p.delay || 0);
+        if (t === 'rotategp') s += ',166,' + (p.ground || 2) + ',167,' + (p.move || 4) + (p.changeChannel ? ',171,1,173,' + (p.targetChannel || 0) : '') + (p.channelOnly ? ',172,1' : '') + (p.realTouch ? ',11,1' : '');
+        if (t !== 'rotategp' && p.channel) s += ',170,' + p.channel + (p.ord ? ',115,' + p.ord : '');
+        if (t === 'camrot') s += ',68,' + (p.degrees || 0) + ',70,' + (p.add ? 1 : 0);
+        if (t === 'zoom') s += ',371,' + (p.zoom === undefined ? 1 : p.zoom) + ',30,' + (p.easingType || 0) + ',85,' + (p.easingRate === undefined ? 2 : p.easingRate);
+        if (t === 'static') s += ',71,' + (p.target || 0) + ',110,' + (p.exit ? 1 : 0);
+        if (t === 'static') s += ',212,' + (p.follow ? 1 : 0) + ',213,' + (p.followEasing || 1) + ',453,' + (p.smoothVelocity ? 1 : 0) + ',454,' + (p.smoothVelocityMod === undefined ? 1 : p.smoothVelocityMod) + ',465,' + (p.exitInstant ? 1 : 0) + ',30,' + (p.easingType || 0) + ',85,' + (p.easingRate === undefined ? 2 : p.easingRate);
+        if (t === 'camrot') s += ',394,' + (p.snap360 ? 1 : 0) + ',30,' + (p.easingType || 0) + ',85,' + (p.easingRate === undefined ? 2 : p.easingRate);
+        if (t === 'cameraEdge') s += ',164,' + (p.edge || 0);
+        if (t === 'cameraMode') s += ',111,' + (p.freeMode ? 1 : 0) + ',112,' + (p.editSettings ? 1 : 0) + ',113,' + (p.easing || 1) + ',114,' + (p.padding || 0);
+        if (t === 'event') s += ',447,' + (p.extraId || 0) + ',525,' + (p.player || 0) + ',430,' + (p.eventRaw || (p.events || []).join('.'));
+        if (t === 'zoom' || t === 'static' || t === 'camoffset') s += ',101,' + (p.axis || 0);
         if (t === 'rotate') s += ',68,' + (p.degrees || 0) + ',69,' + (p.times360 || 0) + ',70,' + (p.lockRotation ? 1 : 0) + ',71,' + (p.centerGroup || 0) + ',30,' + (p.easingType || 0) + ',85,' + (p.easingRate === undefined ? 2 : p.easingRate);
         if (t === 'pulse') s += ',52,' + (p.targetType || 0) + ',7,' + (p.r === undefined ? 255 : p.r) + ',8,' + (p.g === undefined ? 255 : p.g) + ',9,' + (p.b === undefined ? 255 : p.b) + ',45,' + (p.fadeIn || 0) + ',46,' + (p.hold || 0) + ',47,' + (p.fadeOut || 0);
+        if (t === 'gravity') s += ',148,' + (p.gravity === undefined ? 1 : p.gravity) + (p.p1 === false ? ',200,1' : '') + (p.p2 === false ? ',201,1' : '');
+        if (t === 'playerControl') {
+          s += ',540,' + (p.stopJump ? 1 : 0) + ',541,' + (p.stopMove ? 1 : 0) + ',542,' + (p.stopRotate ? 1 : 0) + ',543,' + (p.stopSlide ? 1 : 0);
+          // Preserve the player filters encoded by the reference k138/k200 pair.
+          if (p.p1 === false) s += ',200,1';
+          else if (p.p2 === false) s += ',138,1';
+        }
+        if (t === 'timewarp') s += ',120,' + (p.timeMod === undefined ? 1 : p.timeMod);
+        if (t === 'teleport') {
+          s += ',354,' + (p.gravityMode || 0) + ',352,' + (p.usePlayerX ? 1 : 0) + ',353,' + (p.usePlayerY ? 1 : 0) + ',443,' + (p.noEffects ? 1 : 0);
+          if (p.teleportY !== undefined && p.teleportY !== null) s += ',54,' + p.teleportY;
+        }
+        if (t === 'end') s += ',460,' + (p.noEffects ? 1 : 0) + ',461,' + (p.noSFX ? 1 : 0) + ',487,' + (p.instant ? 1 : 0);
         if (p.touch) s += ',11,1';
+        if (p.multiTrigger) s += ',87,1';
         if (p.delay && t !== 'spawn') s += ',63,' + p.delay;
+      } else if (o.id === 2016 && o.p) {
+        s += ',28,' + (o.p.dx || 0) + ',29,' + (o.p.dy || 0) + ',371,' + (o.p.zoom || 1) + ',506,' + (o.p.previewOpacity === undefined ? 1 : o.p.previewOpacity);
       } else if (o.p && COL_TRIG[o.id]) {
         var cp = o.p;
         if (o.id !== 29 && o.id !== 30) s += ',23,' + (cp.channel || 0);
         s += ',7,' + (cp.r === undefined ? 255 : cp.r) + ',8,' + (cp.g === undefined ? 255 : cp.g) + ',9,' + (cp.b === undefined ? 255 : cp.b) + ',10,' + (cp.dur || 0);
         if (cp.op !== undefined && cp.op !== 1) s += ',35,' + cp.op;
         if (cp.touch) s += ',11,1';
+      }
+      if (o.rawProps && (o.id === 2016 || o.id === 2063)) {
+        var skipRaw = { 1:1,2:1,3:1,4:1,5:1,6:1,20:1,21:1,22:1,24:1,25:1,31:1,32:1,33:1,54:1,57:1,61:1 };
+        if (o.id === 2016) { skipRaw[28]=1; skipRaw[29]=1; skipRaw[371]=1; skipRaw[506]=1; }
+        Object.keys(o.rawProps).forEach(function (key) { var n = parseInt(key.slice(1), 10); if (n > 0 && !skipRaw[n]) s += ',' + n + ',' + o.rawProps[key]; });
       }
       return s;
     }).join(';');
@@ -393,6 +514,7 @@ var LevelModel = (function () {
     if (entries.length) header.push('kS38,' + entries.join('|'));
     if (level.bgId !== undefined && level.bgId !== null) header.push('kA6,' + (parseInt(level.bgId, 10) || 1));
     if (level.groundId !== undefined && level.groundId !== null) header.push('kA7,' + (parseInt(level.groundId, 10) || 1));
+    if (level.platformer) header.push('kA22,1');
     header.push('kS1');
     return header.join(';') + ';' + gdObjects(level) + ';';
   }
@@ -471,6 +593,13 @@ var LevelModel = (function () {
       var grp = grpRaw.map(Number).filter(function (n, idx, all) { return n > 0 && all.indexOf(n) === idx; });
       var rec = { id: id, gx: gx, gy: gy, flipX: d.k4 === '1', flipY: d.k5 === '1' };
       if (d.k6) rec.rot = objectRotation;          // rotation in degrees, clockwise on screen
+      var uniScale = d.k32 !== undefined ? parseFloat(d.k32) : NaN;
+      var scaleXv = d.k128 !== undefined ? parseFloat(d.k128) : uniScale;
+      var scaleYv = d.k129 !== undefined ? parseFloat(d.k129) : uniScale;
+      if (isFinite(scaleXv) && scaleXv !== 0 && Math.abs(scaleXv) !== 1) rec.sx = Math.abs(scaleXv);
+      if (isFinite(scaleYv) && scaleYv !== 0 && Math.abs(scaleYv) !== 1) rec.sy = Math.abs(scaleYv);
+      if (d.k135 === '1') rec.hidden = true;       // reference: the sprite is hidden (the collider stays)
+      if (d.k121 === '1') rec.noTouch = true;      // reference: no collider
       if (d.k21) rec.col = parseInt(d.k21, 10) || 0;      // base colour channel
       if (d.k22) rec.col2 = parseInt(d.k22, 10) || 0;     // detail colour channel (reference detailChannel)
       // legacy 1.9 colour key k19 maps to a modern channel and clears the detail channel
@@ -487,8 +616,85 @@ var LevelModel = (function () {
         rec.p = { target: parseInt(d.k51 || '0', 10), dur: d.k10 === undefined ? 0 : (parseFloat(d.k10) || 0),
           dx: parseFloat(d.k28 || '0') || 0, dy: parseFloat(d.k29 || '0') || 0,
           opacity: d.k35 === undefined ? 1 : parseFloat(d.k35), activate: d.k56 === '1' ? 1 : 0,
-          touch: d.k11 === '1', delay: parseFloat(d.k63 || '0') || 0,
+          touch: d.k11 === '1', multiTrigger: d.k87 === '1', delay: parseFloat(d.k63 || '0') || 0,
           easingType: parseInt(d.k30 || '0', 10) || 0, easingRate: d.k85 === undefined ? 2 : (parseFloat(d.k85) || 0) };
+        if (id === 2066) {
+          var gravityValue = d.k148 === undefined ? 1 : parseFloat(d.k148);
+          if (!isFinite(gravityValue)) gravityValue = 1;
+          rec.p.gravity = Math.max(0.1, Math.min(2, gravityValue));
+          rec.p.p1 = d.k200 !== '1';
+          rec.p.p2 = d.k138 !== '1' && d.k201 !== '1';
+        } else if (id === 1932) {
+          rec.p.stopJump = d.k540 === '1';
+          rec.p.stopMove = d.k541 === '1';
+          rec.p.stopRotate = d.k542 === '1';
+          rec.p.stopSlide = d.k543 === '1';
+          rec.p.p1 = d.k138 === '1' || d.k200 !== '1';
+          rec.p.p2 = d.k138 !== '1' || d.k200 === '1';
+        } else if (id === 1935) {
+          var timeModValue = d.k120 === undefined ? 1 : parseFloat(d.k120);
+          if (!isFinite(timeModValue)) timeModValue = 1;
+          rec.p.timeMod = Math.max(0.1, Math.min(2, timeModValue));
+        } else if (id === 3022) {
+          rec.p.gravityMode = Math.max(0, Math.min(3, parseInt(d.k354 || '0', 10) || 0));
+          var teleportYValue = d.k54 === undefined ? NaN : parseFloat(d.k54);
+          rec.p.teleportY = isFinite(teleportYValue) ? teleportYValue : null;
+          rec.p.usePlayerX = d.k352 === '1';
+          rec.p.usePlayerY = d.k353 === '1';
+          rec.p.noEffects = d.k443 === '1';
+        } else if (id === 3600) {
+          rec.p.noEffects = d.k460 === '1';
+          rec.p.noSFX = d.k461 === '1';
+          rec.p.instant = d.k487 === '1';
+        } else if (id === 1914) {
+          rec.p.follow = d.k212 === '1';
+          rec.p.followEasing = Math.max(0.1, parseFloat(d.k213 || '1') || 1);
+          rec.p.smoothVelocity = d.k453 === '1';
+          rec.p.smoothVelocityMod = d.k454 === undefined ? 1 : (parseFloat(d.k454) || 0);
+          rec.p.exitInstant = d.k465 === '1';
+        } else if (id === 2015) {
+          rec.p.snap360 = d.k394 === '1';
+          rec.p.easingType = parseInt(d.k30 || '0', 10) || 0;
+          rec.p.easingRate = d.k85 === undefined ? 2 : (parseFloat(d.k85) || 2);
+        } else if (id === 2062) {
+          rec.p.edge = parseInt(d.k164 || '0', 10) || 0;
+        } else if (id === 2925) {
+          rec.p.freeMode = d.k111 === '1';
+          rec.p.editSettings = d.k112 === '1';
+          rec.p.easing = Math.max(1, Math.min(40, parseFloat(d.k113 || '1') || 1));
+          rec.p.padding = Math.max(0, Math.min(1, parseFloat(d.k114 || '0') || 0));
+        } else if (id === 3604) {
+          rec.p.extraId = parseInt(d.k447 || '0', 10) || 0;
+          rec.p.player = Math.max(0, Math.min(2, parseInt(d.k525 || '0', 10) || 0));
+          rec.p.eventRaw = d.k430 || '';
+          rec.p.events = String(rec.p.eventRaw).split(/[.|]/).map(Number).filter(function (v) { return isFinite(v) && v >= 0; });
+        }
+        if (TRIG[id]) { rec.p.channel = parseInt(d.k170 || '0', 10) || 0; rec.p.ord = parseInt(d.k115 || '0', 10) || 0; }   // trigger channel and order (reference 170, 115)
+        if (id === 2900) {                                   // rotate gameplay (reference rotateGameplay): touch-triggered
+          rec.p.ground = parseInt(d.k166 || '2', 10) || 2;
+          rec.p.move = parseInt(d.k167 || '4', 10) || 4;
+          rec.p.touch = true;
+          rec.p.realTouch = d.k11 === '1';
+          rec.p.changeChannel = d.k171 === '1';
+          rec.p.targetChannel = parseInt(d.k173 || '0', 10) || 0;
+          rec.p.channelOnly = d.k172 === '1';
+        }
+        if (id === 2015) {                                   // camera rotate (reference cameraRotate)
+          rec.p.degrees = parseFloat(d.k68 || '0') || 0;
+          rec.p.add = d.k70 === '1';
+        }
+        if (id === 1913) {                                   // camera zoom (reference cameraZoom)
+          rec.p.zoom = Math.max(0.4, Math.min(3, parseFloat(d.k371 || '1') || 1));
+          rec.p.easingType = parseInt(d.k30 || '0', 10) || 0;
+          rec.p.easingRate = d.k85 === undefined ? 2 : (parseFloat(d.k85) || 2);
+        }
+        if (id === 1914) {                                   // static camera (reference staticCamera)
+          rec.p.target = parseInt(d.k71 || '0', 10) || 0;
+          rec.p.exit = d.k110 === '1';
+          rec.p.easingType = parseInt(d.k30 || '0', 10) || 0;
+          rec.p.easingRate = d.k85 === undefined ? 2 : (parseFloat(d.k85) || 2);
+        }
+        if (id === 1913 || id === 1914 || id === 1916) rec.p.axis = parseInt(d.k101 || '0', 10) || 0;
         if (id === 1346) {
           rec.p.degrees = parseFloat(d.k68 || '0') || 0;
           rec.p.times360 = parseInt(d.k69 || '0', 10) || 0;
@@ -507,6 +713,11 @@ var LevelModel = (function () {
           rec.p.hold = parseFloat(d.k46 || '0') || 0;
           rec.p.fadeOut = parseFloat(d.k47 || '0') || 0;
         }
+      } else if (id === 2016) {
+        rec.p = { dx: parseFloat(d.k28 || '0') || 0, dy: parseFloat(d.k29 || '0') || 0, zoom: parseFloat(d.k371 || '1') || 1, previewOpacity: d.k506 === undefined ? 1 : (parseFloat(d.k506) || 0) };
+        rec.rawProps = d;
+      } else if (kind === 'checkpoint') {
+        rec.rawProps = d;
       } else if (TEXT[id]) {
         var tval = d.k31 || '';
         try { tval = fflate.strFromU8(b64urlToBytes(tval)); }
@@ -538,6 +749,7 @@ var LevelModel = (function () {
     // later objects replace earlier ones that cover the same cell (decorations are never replaced)
     var clean = new Level(objs);
     clean.palette = palette;
+    clean.platformer = /(?:^|;)kA22,1(?:;|$)/.test(decoded);
     // background / ground texture selection (reference getBackgroundDisplayId / getGroundTextureId:
     // kA6/kA7 <= 1 mean texture 1) — consumed by the renderer's tiled bg / ground
     var a6 = decoded.match(/kA6,(\d+)/), a7 = decoded.match(/kA7,(\d+)/);
@@ -606,6 +818,6 @@ var LevelModel = (function () {
     DECO_SLOPE: DECO_SLOPE,
     zOf: zOf, importText: importText, exportGmd: exportGmd, exportLevelString: exportLevelString,
     serialize: serialize, PORTAL: PORTAL, SPEED_KEY: SPEED_KEY, FOOT: FOOT, SLOPE: SLOPE,
-    PORTAL_ROWS: PORTAL_ROWS, slopeOf: slopeOf, HAZ: HAZ
+    PORTAL_ROWS: PORTAL_ROWS, slopeOf: slopeOf, HAZ: HAZ, transposeSim: transposeSim
   };
 })();
