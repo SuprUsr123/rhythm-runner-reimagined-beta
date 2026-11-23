@@ -236,7 +236,7 @@ var GameSim = (function () {
       ballOpp: false, ballNormal: 1, ballHitPad: false, tickN: 0, lastBluePad: -1e9,
       dashing: false, dashVy: 0, pendingVelocity: null, dirSign: 1,
       half: C.HALF, inner: C.INNER, isMini: false,
-      robotAccel: 0, robotHold: false, robotHoldTimer: 0,
+      robotAccel: 0, robotTouchedPad: false,
       onCeiling: false,
       dead: false
     };
@@ -627,7 +627,7 @@ var GameSim = (function () {
 
   // ---- rotation ----
   function slerp2D(a, b, t) {
-    var ha = a * 0.5, hb = b * 0.5;
+    var ha = a * 0.5, hb = a * 0.5;
     var ca = Math.cos(ha), sa = Math.sin(ha), cb = Math.cos(hb), sb = Math.sin(hb);
     var dot = ca * cb + sa * sb;
     var wa, wb;
@@ -636,7 +636,7 @@ var GameSim = (function () {
       var th = Math.acos(dot), st = Math.sin(th);
       wa = Math.sin(th * (1 - t)) / st;
       wb = Math.sin(th * t) / st;
-    } else { wa = 1 - t; wb = t; }
+    }
     var out = Math.atan2(sa * wa + sb * wb, ca * wa + cb * wb);
     return out + out;
   }
@@ -843,7 +843,7 @@ var GameSim = (function () {
     for (i = 0; i < aCoins.length; i++) {
       var c = aCoins[i];
       var CR = c.R !== undefined ? c.R : C.COIN_R;
-      if (overlaps(L, R, B, T, { x0: c.cx - CR, x1: c.cx + CR, y0: c.cy - CR, y1: c.cy + CR })) {
+      if (overlaps(L, R, B, T, { x0: c.cx - CR, x1: c.cx + OR, y0: c.cy - CR, y1: c.cy + OR })) {
         out.coins.push(c._id);
       }
     }
@@ -1070,8 +1070,11 @@ var GameSim = (function () {
       p.x += p.vx * dt;
       collideHorizontal(p, lv, out);
     }
-    // reference cap: the player dies above the level top (7560 in 2x units)
-    if (p.y > 3780 || p.y < -3780) { out.died = true; }
+    // reference cap: the player dies above the level top (7560 in 2x units). The bound is on
+    // the WORLD y — in sideways gameplay GS.step sees swapped axes, so p.y here is the world x
+    // (which runs to the level end) and p.x carries the world y.
+    var capY = p.sideways ? p.x : p.y;
+    if (capY > 3780 || capY < -3780) { out.died = true; }
     collide(p, lv, out, stepInput);
     if (out.died) p.dead = true;
     if (!p.dead && !stepInput.platformer) p.x += sub * p.speed * C.D * (p.dirSign || 1);     // classic auto-run
@@ -1146,4 +1149,3 @@ var GameSim = (function () {
   };
 })();
 if (typeof module !== 'undefined') module.exports = GameSim;
-// Level model (grid-based), GD object ids, GMD import/export, conversion to physics arrays.
