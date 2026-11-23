@@ -236,7 +236,7 @@ var GameSim = (function () {
       ballOpp: false, ballNormal: 1, ballHitPad: false, tickN: 0, lastBluePad: -1e9,
       dashing: false, dashVy: 0, pendingVelocity: null, dirSign: 1,
       half: C.HALF, inner: C.INNER, isMini: false,
-      robotAccel: 0, robotTouchedPad: false,
+      robotAccel: 0, robotHold: false, robotHoldTimer: 0,
       onCeiling: false,
       dead: false
     };
@@ -627,7 +627,7 @@ var GameSim = (function () {
 
   // ---- rotation ----
   function slerp2D(a, b, t) {
-    var ha = a * 0.5, hb = a * 0.5;
+    var ha = a * 0.5, hb = b * 0.5;
     var ca = Math.cos(ha), sa = Math.sin(ha), cb = Math.cos(hb), sb = Math.sin(hb);
     var dot = ca * cb + sa * sb;
     var wa, wb;
@@ -843,7 +843,7 @@ var GameSim = (function () {
     for (i = 0; i < aCoins.length; i++) {
       var c = aCoins[i];
       var CR = c.R !== undefined ? c.R : C.COIN_R;
-      if (overlaps(L, R, B, T, { x0: c.cx - CR, x1: c.cx + OR, y0: c.cy - CR, y1: c.cy + OR })) {
+      if (overlaps(L, R, B, T, { x0: c.cx - CR, x1: c.cx + CR, y0: c.cy - CR, y1: c.cy + CR })) {
         out.coins.push(c._id);
       }
     }
