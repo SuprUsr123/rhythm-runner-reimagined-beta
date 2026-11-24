@@ -41,7 +41,14 @@ var LevelModel = (function () {
   var PAD = { 35: true, 140: true, 1332: true, 67: true, 3005: true };
   var ORB = { 36: true, 141: true, 1333: true, 84: true, 1022: true, 1330: true, 1594: true, 1704: true, 1751: true };  // 1704 green dash orb, 1751 blue (gravity-flipping) dash orb
   var COIN = { 142: true, 1329: true };
+  // GD 2.2 Force Blocks are invisible gameplay colliders (not editor-only triggers).
+  // 2069 is the original Force Block; 3645 is the newer variant.
+  var FORCE_BLOCK = { 2069: true, 3645: true };
   var TRIG = { 1049: 'toggle', 1007: 'alpha', 901: 'move', 1616: 'stop', 1268: 'spawn', 1006: 'pulse', 1346: 'rotate', 1913: 'zoom', 1914: 'static', 1916: 'camoffset', 2900: 'rotategp', 2015: 'camrot', 1917: 'reverse', 1932: 'playerControl', 1935: 'timewarp', 2062: 'cameraEdge', 2066: 'gravity', 2925: 'cameraMode', 3022: 'teleport', 3600: 'end', 3604: 'event' };
+  // GD 2.2 shader triggers (reference level-shaders.js _parseShaderTrigger/_fireShaderTrigger).
+  // Each id maps to one post-FX effect; params are parsed into rec.p below.
+  var SHADER_FX = { 2904: 'layers', 2905: 'shockwave', 2907: 'shockline', 2909: 'glitch', 2910: 'chromatic', 2911: 'crt', 2912: 'pixelate', 2913: 'lens', 2914: 'radial', 2915: 'motion', 2916: 'bulge', 2917: 'pinch', 2919: 'grayscale', 2920: 'sepia', 2921: 'invert', 2922: 'hue', 2923: 'color', 2924: 'split' };
+  (function () { for (var k in SHADER_FX) TRIG[k] = 'shader'; })();
   // colour triggers (reference level.js LEGACY_COLOR_TRIGGER_CHANNELS): 29 BG, 30 ground,
   // legacy ids carry a default channel; k23 overrides it per instance
   var COL_TRIG = { 29: true, 30: true, 105: true, 221: true, 717: true, 718: true, 743: true, 744: true, 899: true, 900: true, 915: true };
@@ -91,6 +98,13 @@ var LevelModel = (function () {
     if (o.cx !== undefined) { t.cx = o.cy; t.cy = o.cx; }
     if (o.w !== undefined && o.h !== undefined) { t.w = o.h; t.h = o.w; }
     if (o.rot !== undefined) t.rot = -o.rot;
+    // A sideways gameplay transform swaps the force vector's axes as well as the
+    // collider's geometry. Keep a transformed fixed-force angle; radial forces are
+    // recomputed from the already-transposed player/block positions.
+    if (o.forceRadial !== undefined && !o.forceRadial) {
+      var fa = (90 - (o.rot || 0) + (o.forceFlipY ? 180 : 0)) * Math.PI / 180;
+      t.forceAngle = Math.atan2(Math.cos(fa), Math.sin(fa));
+    }
     t.orig = o.orig || o;
     t._s = 0; t._aff = false;
     return t;
@@ -98,8 +112,8 @@ var LevelModel = (function () {
   function transposeSim(lv) {
     var dyn = lv.dyn || null;
     if (lv._T && lv._TDyn === dyn) return lv._T;
-    var keys = ['solids', 'spikes', 'portals', 'speeds', 'pads', 'orbs', 'slopes', 'coins'];
-    var T = { solids: [], spikes: [], portals: [], speeds: [], pads: [], orbs: [], slopes: [], coins: [], triggers: lv.triggers || [], dyn: null, dynBase: {} };
+    var keys = ['solids', 'spikes', 'portals', 'speeds', 'pads', 'orbs', 'slopes', 'coins', 'forceBlocks'];
+    var T = { solids: [], spikes: [], portals: [], speeds: [], pads: [], orbs: [], slopes: [], coins: [], forceBlocks: [], triggers: lv.triggers || [], dyn: null, dynBase: {} };
     keys.forEach(function (k) {
       var sources = [];
       (lv[k] || []).forEach(function (o) { if (o !== GROUND && !o._aff) sources.push(o); });
@@ -129,14 +143,14 @@ var LevelModel = (function () {
     GameSim.buildGrids(T);
     // buildGrids renumbers the ids; put back the ids of the original records (latches and coin indices use them)
     keys.forEach(function (k) { T[k].forEach(function (t) { t._id = (t.orig || t)._id; }); });
-    T.dyn = { solids: [], spikes: [], portals: [], speeds: [], pads: [], orbs: [], slopes: [], coins: [] };
+    T.dyn = { solids: [], spikes: [], portals: [], speeds: [], pads: [], orbs: [], slopes: [], coins: [], forceBlocks: [] };
     lv._T = T; lv._TDyn = dyn;
     return T;
   }
   var CELL = 30;
   var PORTAL_ROWS = 3;                            // portals are 3 blocks tall
 
-  var DYN_KEYS = ['solids', 'spikes', 'portals', 'speeds', 'pads', 'orbs', 'slopes', 'coins', 'breakables'];
+  var DYN_KEYS = ['solids', 'spikes', 'portals', 'speeds', 'pads', 'orbs', 'slopes', 'coins', 'breakables', 'forceBlocks'];
   var KIND_MEMO = {};
   function kindOf(id) {
     var m = KIND_MEMO[id];
@@ -147,6 +161,7 @@ var LevelModel = (function () {
   }
   function kindOfRaw(id) {
     if (id === 2063) return 'checkpoint';
+    if (FORCE_BLOCK[id]) return 'forceBlock';
     if (SLOPE[id]) return DECO_SLOPE[id] ? 'decor' : 'slope';
     if (SOLID[id] || defType(id) === 's') return 'solid';
     if (SPIKE[id]) return 'spike';
@@ -179,6 +194,7 @@ var LevelModel = (function () {
   }
   function footprintRaw(o, kind) {
     if (kind === 'fx') return { w: 0, h: 0 };
+    if (kind === 'forceBlock') return gridOf(o.id) || { w: 1, h: 1 };
     if (kind === 'slope') {
       var w = SLOPE[o.id].gw, h = SLOPE[o.id].gh;
       // a quarter-turn rotation swaps the footprint box (rot 45/135 wedges keep it: drawn as walls)
@@ -284,7 +300,7 @@ var LevelModel = (function () {
   Level.prototype.clear = function () { this.objs = []; this.touch(); };
   Level.prototype.sim = function () {
     if (!this.dirty && this._sim) return this._sim;
-    var lv = { solids: [GROUND], spikes: [], portals: [], speeds: [], pads: [], orbs: [], slopes: [], coins: [], triggers: [], colourTriggers: [], breakables: [], checkpoints: [] };
+    var lv = { solids: [GROUND], spikes: [], portals: [], speeds: [], pads: [], orbs: [], slopes: [], coins: [], triggers: [], colourTriggers: [], breakables: [], forceBlocks: [], checkpoints: [] };
     var entries = [], exits = [], maxGx = 0;
     this.objs.forEach(function (o) {
       if (o.gx > maxGx) maxGx = o.gx;                 // the finish line counts every object, broken or not
@@ -309,7 +325,7 @@ var LevelModel = (function () {
       // grouped objects are routed to the dynamic list and placed each frame (see GameSim.refreshDyn)
       var L = lv;
       var grouped = !!(o.groups && o.groups.length);
-      var lens = grouped ? { solids: L.solids.length, spikes: L.spikes.length, portals: L.portals.length, speeds: L.speeds.length, pads: L.pads.length, orbs: L.orbs.length, slopes: L.slopes.length, coins: L.coins.length, breakables: L.breakables.length } : null;
+      var lens = grouped ? { solids: L.solids.length, spikes: L.spikes.length, portals: L.portals.length, speeds: L.speeds.length, pads: L.pads.length, orbs: L.orbs.length, slopes: L.slopes.length, coins: L.coins.length, breakables: L.breakables.length, forceBlocks: L.forceBlocks.length } : null;
       if (kind === 'solid' && BREAKABLE[o.id]) {
         lv.breakables.push({ x0: x0, x1: x1, y0: y0, y1: y1, ref: o });
       } else if (kind === 'solid') {
@@ -334,8 +350,8 @@ var LevelModel = (function () {
         var hsx = o.sx || 1, hsy = o.sy || 1;
         if (bx.r !== undefined) bx = { r: bx.r * (hsx + hsy) / 2 }; else bx = [bx[0] * hsx, bx[1] * hsy];
         var hx = x0 + fp.w * CELL / 2, hy = y0 + fp.h * CELL / 2;
-        if (bx.r !== undefined) L.spikes.push({ cx: hx, cy: hy, r: bx.r, rot: o.rot || 0 });
-        else L.spikes.push({ x0: hx - bx[0] / 2, x1: hx + bx[0] / 2, y0: hy - bx[1] / 2, y1: hy + bx[1] / 2, cx: hx, cy: hy, w: bx[0], h: bx[1], rot: o.rot || 0 });
+        if (bx.r !== undefined) L.spikes.push({ cx: hx, cy: hy, r: bx.r, rot: o.rot || 0, id: o.id });
+        else L.spikes.push({ x0: hx - bx[0] / 2, x1: hx + bx[0] / 2, y0: hy - bx[1] / 2, y1: hy + bx[1] / 2, cx: hx, cy: hy, w: bx[0], h: bx[1], rot: o.rot || 0, id: o.id });
       } else if (kind === 'slope') {
         if (DECO_SLOPE[o.id]) {
           // reference: decoration slopes get no collider (level.js _createSlopeCollider)
@@ -382,6 +398,26 @@ var LevelModel = (function () {
       } else if (kind === 'coin') {
         var cg = WD_GRIDS[o.id] || [30, 30];
         L.coins.push({ cx: x0 + fp.w * CELL / 2, cy: y0 + fp.h * CELL / 2, R: cg[0] / 2, id: o.id });
+      } else if (kind === 'forceBlock') {
+        // Reference level.js: Force Blocks have a scaled, rotated rectangular collider,
+        // are invisible at runtime, and are ignored when No Touch (k121) is enabled.
+        if (!o.noTouch) {
+          var fraw = o.rawProps || {};
+          var fval = function (key, fallback) { var v = parseFloat(fraw['k' + key]); return isFinite(v) ? v : fallback; };
+          var fcx = x0 + fp.w * CELL / 2, fcy = y0 + fp.h * CELL / 2;
+          var fw = fp.w * CELL * (o.sx || 1), fh = fp.h * CELL * (o.sy || 1);
+          var frot = o.rot || 0, frad = frot * Math.PI / 180;
+          var fex = (Math.abs(Math.cos(frad)) * fw + Math.abs(Math.sin(frad)) * fh) / 2;
+          var fey = (Math.abs(Math.sin(frad)) * fw + Math.abs(Math.cos(frad)) * fh) / 2;
+          L.forceBlocks.push({
+            id: o.id, cx: fcx, cy: fcy, w: fw, h: fh, rot: frot,
+            x0: fcx - fex, x1: fcx + fex, y0: fcy - fey, y1: fcy + fey,
+            force: fval(149, 0), forceMin: fval(526, 0), forceMax: fval(527, 0),
+            forceRadial: fraw.k528 === '1', forceRange: fraw.k529 === '1',
+            forceId: parseInt(fraw.k530 || '0', 10) || 0, forceFlipY: !!o.flipY,
+            radius: Math.max(fw, fh) / 2
+          });
+        }
       }
       // tag the record this object just produced with its groups (dynamic objects only)
       if (grouped) DYN_KEYS.forEach(function (k) { if (L[k].length > lens[k]) L[k][L[k].length - 1].groups = o.groups.slice(); });
@@ -397,13 +433,13 @@ var LevelModel = (function () {
     });
     // ids for the dynamic records (kept apart from the static ids)
     var dynBase = {};
-    ['solids', 'spikes', 'portals', 'speeds', 'pads', 'orbs', 'slopes', 'coins', 'breakables'].forEach(function (k) {
+    ['solids', 'spikes', 'portals', 'speeds', 'pads', 'orbs', 'slopes', 'coins', 'breakables', 'forceBlocks'].forEach(function (k) {
       dynBase[k] = lv[k].filter(function (r) { return r.groups; });
       if (k === 'breakables') lv.breakables = lv.breakables.filter(function (r) { return !r.groups; });
     });
     lv.dynBase = dynBase;
     GameSim.buildGrids(lv);
-    lv.dyn = { solids: [], spikes: [], portals: [], speeds: [], pads: [], orbs: [], slopes: [], coins: [], breakables: [] };
+    lv.dyn = { solids: [], spikes: [], portals: [], speeds: [], pads: [], orbs: [], slopes: [], coins: [], breakables: [], forceBlocks: [] };
     GameSim.refreshDyn(lv, function () { return { dx: 0, dy: 0, hidden: false, alpha: 1 }; });
     lv.solidsCount = lv.solids.length;
     lv.endX = (maxGx + 3) * CELL;
@@ -477,7 +513,7 @@ var LevelModel = (function () {
         if (cp.op !== undefined && cp.op !== 1) s += ',35,' + cp.op;
         if (cp.touch) s += ',11,1';
       }
-      if (o.rawProps && (o.id === 2016 || o.id === 2063)) {
+      if (o.rawProps && (o.id === 2016 || o.id === 2063 || FORCE_BLOCK[o.id])) {
         var skipRaw = { 1:1,2:1,3:1,4:1,5:1,6:1,20:1,21:1,22:1,24:1,25:1,31:1,32:1,33:1,54:1,57:1,61:1 };
         if (o.id === 2016) { skipRaw[28]=1; skipRaw[29]=1; skipRaw[371]=1; skipRaw[506]=1; }
         Object.keys(o.rawProps).forEach(function (key) { var n = parseInt(key.slice(1), 10); if (n > 0 && !skipRaw[n]) s += ',' + n + ',' + o.rawProps[key]; });
@@ -712,12 +748,41 @@ var LevelModel = (function () {
           rec.p.fadeIn = parseFloat(d.k45 || '0') || 0;
           rec.p.hold = parseFloat(d.k46 || '0') || 0;
           rec.p.fadeOut = parseFloat(d.k47 || '0') || 0;
+        } else if (SHADER_FX[id]) {
+          // reference _parseShaderTrigger: value keys 175/176/179/180/189/191 + 512 (max dist),
+          // booleans 184-194 + 513/514/515, centre group 71, layers 196/197, p1/p2 138/200
+          rec.p.fx = SHADER_FX[id];
+          rec.p.v175 = parseFloat(d.k175 || '0') || 0;
+          rec.p.v176 = parseFloat(d.k176 || '0') || 0;
+          rec.p.v179 = parseFloat(d.k179 || '0') || 0;
+          rec.p.v180 = parseFloat(d.k180 || '0') || 0;
+          rec.p.v189 = parseFloat(d.k189 || '0') || 0;
+          rec.p.v191 = parseFloat(d.k191 || '0') || 0;
+          rec.p.v512 = parseFloat(d.k512 || '0') || 0;
+          rec.p.v290 = parseFloat(d.k290 || '0') || 0;
+          rec.p.v291 = parseFloat(d.k291 || '0') || 0;
+          rec.p.b184 = d.k184 === '1';
+          rec.p.b185 = d.k185 === '1';
+          rec.p.b186 = d.k186 === '1';
+          rec.p.b187 = d.k187 === '1';
+          rec.p.b188 = d.k188 === '1';
+          rec.p.b190 = d.k190 === '1';
+          rec.p.b192 = d.k192 === '1';
+          rec.p.b194 = d.k194 === '1';
+          rec.p.b513 = d.k513 === '1';
+          rec.p.b514 = d.k514 === '1';
+          rec.p.p1 = d.k138 === '1';
+          rec.p.p2 = d.k200 === '1';
+          rec.p.centerGroup = parseInt(d.k71 || '0', 10) || 0;
+          rec.p.layerMin = parseInt(d.k196 || '0', 10) || 0;
+          rec.p.layerMax = parseInt(d.k197 || '0', 10) || 0;
         }
       } else if (id === 2016) {
         rec.p = { dx: parseFloat(d.k28 || '0') || 0, dy: parseFloat(d.k29 || '0') || 0, zoom: parseFloat(d.k371 || '1') || 1, previewOpacity: d.k506 === undefined ? 1 : (parseFloat(d.k506) || 0) };
         rec.rawProps = d;
-      } else if (kind === 'checkpoint') {
+      } else if (kind === 'checkpoint' || kind === 'forceBlock') {
         rec.rawProps = d;
+        if (kind === 'forceBlock' && d.k121 === '1') rec.noTouch = true;
       } else if (TEXT[id]) {
         var tval = d.k31 || '';
         try { tval = fflate.strFromU8(b64urlToBytes(tval)); }

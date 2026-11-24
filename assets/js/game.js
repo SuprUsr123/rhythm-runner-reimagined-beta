@@ -457,6 +457,7 @@
     var playerHold = hold && !pl.stopJumpUntilRelease;
     var r = GS.step(pl, sub, { pressed: playerPressed, hold: playerHold, platformer: !!LEVEL.platformer, left: pl === p ? leftHeld : false, right: pl === p ? rightHeld : false, freeModeCamera: freeCameraMode }, lvStep);
     if (sideways) swapSidewaysFrame(pl);
+    if (r.died && !pl.__deathLogged && typeof window !== 'undefined' && window.__onDeath) { pl.__deathLogged = true; try { window.__onDeath(pl, r, lvStep); } catch (e) { } }
     if (r.portal) {
       // stacked portals arrive as an array (gamemode + gravity + size at the same spot)
       if (r.portal instanceof Array) {
@@ -786,6 +787,7 @@
       }
       return;
     }
+    if (t.kind === 'shader') { fireShader(t); return; }
     if (!g) return;
     dynDirty = true;
     if (t.kind === 'stop') { stopGroup(g); return; }
@@ -811,6 +813,7 @@
     if (p) { p.gravityScale = 1; p.stopJumpUntilRelease = false; }
     if (p2) { p2.gravityScale = 1; p2.stopJumpUntilRelease = false; }
     camZoom = 1; camOffX = 0; camOffY = 0; camLocked = false; camTweens = []; camAngle = 0;
+    resetFx();
     setupChannels();
     camWorldX = p ? p.x : 0; cameraStatic = null; cameraEdges = {}; freeCameraMode = false; freeCamEasing = 1; freeCamPadding = 0;
     rebuildGroupCenters();
@@ -1006,7 +1009,7 @@
     processColourTriggers();
     if (p) lastTriggerX = p.x;       // teleport triggers can relocate the player during this sweep
     if (status !== 'play') { dirty = true; return; }
-    tickTweens(timeWarp); tickCamera(timeWarp);
+    tickTweens(timeWarp); tickCamera(timeWarp); stepShaders(timeWarp / 60);
     var lvNow = LEVEL.sim();
     if (dynDirty || lvNow !== lastDynLevel) {
       GameSim.refreshDyn(lvNow, groupInfo);
@@ -1634,6 +1637,9 @@
   }
 
   function drawSpriteObj(g, toS, o, x0, y1, alpha, rotationExtra, pulseTint) {
+    // object scale (level keys sx / sy). drawWorld has already scaled the box about its centre, so the
+    // centre is recovered from the scaled box and the sprite (and its children) take the scale.
+    var osx = o.sx || 1, osy = o.sy || 1;
     if (MONO) return false;
     var kind = kindFast(o);
     var name = frameForObject(o);
@@ -1642,9 +1648,9 @@
     // in the atlas, e.g. the "noen" typo) render through their children only — no fallback box
     if ((!name || !FRAMES[name] || !FRAMES[name][3] || !FRAMES[name][4]) && kidList && kidList.length) {
       var fp0 = footFast(o);
-      var ccx = x0 + fp0.w * CELL / 2, ccy = y1 - fp0.h * CELL / 2;
+      var ccx = x0 + fp0.w * CELL * osx / 2, ccy = y1 - fp0.h * CELL * osy / 2;
       var C0 = toS(ccx, ccy), O0 = toS(ccx + 1, ccy + 1);
-      var kx0 = Math.abs(O0.x - C0.x), ky0 = Math.abs(O0.y - C0.y);
+      var kx0 = Math.abs(O0.x - C0.x) * osx, ky0 = Math.abs(O0.y - C0.y) * osy;
       var col0 = pulseTint || chanColor(o);
       var ga0 = g.globalAlpha, gco0 = g.globalCompositeOperation;
       // reference _mirrorTransformObjects: objects fade out toward the screen edges mid-flip
@@ -1674,11 +1680,11 @@
     if (f[9] || !sheetImage(f[0])) return false;     // rotated atlas frames and unloaded sheets use the fallback
     var u = SPRITE_UNIT;
     var fp = footFast(o);
-    var cx = x0 + fp.w * CELL / 2, cy = y1 - fp.h * CELL / 2;      // object centre, world units
+    var cx = x0 + fp.w * CELL * osx / 2, cy = y1 - fp.h * CELL * osy / 2;      // object centre, world units
     // The level object's x/y is the authored sprite origin. Preserve the trimmed
     // atlas frame's source-size offset in that local coordinate space before rotation.
     var C = toS(cx, cy), O = toS(cx + 1, cy + 1), Z = toS(cx, cy);
-    var kx = Math.abs(O.x - Z.x), ky = Math.abs(O.y - Z.y);          // screen px per world unit
+    var kx = Math.abs(O.x - Z.x) * osx, ky = Math.abs(O.y - Z.y) * osy;          // screen px per world unit (scaled by sx / sy)
     // reference _mirrorTransformObjects: fade toward the screen edges while the flip animates
     var mirP = mirrorProgress();
     if (mirP > 0 && mirP < 1) {
@@ -1897,7 +1903,7 @@
       var o = objs[oi];
       if (o.broken) continue;
       var kind = kindFast(o);
-      if (kind === 'trigger' || kind === 'fx') continue;
+      if (kind === 'trigger' || kind === 'fx' || kind === 'forceBlock') continue;
       if (live && o.hidden) continue;          // reference key 135: the sprite is hidden during play
       if (live && PLAY_HIDDEN[o.id]) continue;      // reference: editor-only dblock sprites are hidden during play
       var inf = live ? (o.groups ? groupInfo(o.groups) : DEFAULT_INF) : null;
@@ -1997,7 +2003,7 @@
         }
       } else if (kind === 'pad') {
         // the atlas pad frame is anchored to the pad's object centre (matches the physics band)
-        if (drawSpriteObj(g, toS, o, x0, y0 + fp.h * CELL, 1, rotationExtra, pulseTint)) continue;
+        if (drawSpriteObj(g, toS, o, x0, y1, 1, rotationExtra, pulseTint)) continue;
         var pt = toS(x0, y0 + C.PAD_H);
         g.fillStyle = '#000'; g.fillRect(a.x, pt.y, w, a.y - pt.y);
         g.fillStyle = '#fff'; g.font = 'bold ' + Math.round(10 * s / 2) + 'px Arial, sans-serif';
@@ -2564,6 +2570,491 @@
     drawPlayer(g, toS, s, pl, invert);
     g.restore();
   }
+  // ================= GD 2.2 shader triggers (2904-2924) as Canvas 2D post-FX =================
+  // Behaviour reference: Web Dashers level-shaders.js (value tweens, clocks, and the
+  // shockwave/shockline ring math of GD_SHADER_SOURCE). Everything here renders with plain
+  // canvas strip/cell blits and ctx.filter — no WebGL, no shaders, no particles. When no
+  // effect is active the whole path costs one boolean check per frame.
+  var fx = {
+    active: false, clock: 0,
+    // colour-space values (tweened)
+    gray: 0, grayTintCh: 0, grayLum: false, sepia: 0, invert: 0, invertR: 1, invertG: 1, invertB: 1, invertClamp: false,
+    hue: 0, chromX: 0, chromY: 0,
+    colorR: 1, colorG: 1, colorB: 1, addR: 0, addG: 0, addB: 0,
+    // lens / radial / bulge
+    lensStrength: 0, lensSize: 0, lensFade: 0, lensOffX: 0, lensOffY: 0, lensTarget: 0, lensChannel: 0, lensAdd: false,
+    radial: 0, radialI: 0, radialFade: 0, radialOffX: 0, radialOffY: 0, radialTarget: 0, radialOnlyEmpty: false,
+    bulge: 0, bulgeOffX: 0, bulgeOffY: 0, bulgeRadius: 0, bulgeTarget: 0, bulgeValue2: 0,
+    // shockwave / shockline clocks + params (reference _swTime / _slTime + uniforms)
+    swActive: false, swTime: 0, swInvert: false, swTarget: 0, swOffX: 0, swOffY: 0,
+    slActive: false, slTime: 0, slTarget: 0, slOff: 0, slAxis: false, slDir: false, slDual: false, slFlip: false,
+    swSpeed: 0, swThick: 0, swStrength: 0, swWidth: 0, swFadeIn: 0, swFadeOut: 0, swMin: 0, swMax: 0, swMaxDist: 0, swTimeOff: 0,
+    slSpeed: 0, slThick: 0, slStrength: 0, slWidth: 0, slFadeIn: 0, slFadeOut: 0, slMaxDist: 0, slTimeOff: 0,
+    // CRT (2911 "chromatic glitch")
+    cgEnabled: false, cgTime: 0, cgSpeed: 0, cgRGB: 0, cgYOff: 0, cgStrength: 0, cgHeight: 0, cgLineFade: 0, cgLineThick: 0, cgFollow: false,
+    // parsed but not rendered (Dash contains none of them)
+    glitch: 0, pixX: 0, pixY: 0, pinchX: 0, pinchY: 0, splitR: 0, splitC: 0
+  };
+  var fxTweens = [];
+  var fxCvs = null, fxCtx = null, fxW = 0, fxH = 0;
+  var fxCvsB = null, fxCtxB = null;              // scratch buffer (channel isolation / CRT compose)
+  var fxToS = null;                               // play transform for player-anchored effects
+  var fxFilterOK = false;
+  var FX_SL = 40, FX_CELLS_X = 10, FX_CELLS_Y = 6, FX_RINGS = 12, FX_CG_SLICES = 24, FX_RAD_COPIES = 5;
+  function fxSmoothstep(a, b, x) {
+    if (x <= a) return 0;
+    if (x >= b) return 1;
+    var t = (x - a) / (b - a);
+    return t * t * (3 - 2 * t);
+  }
+  function fxNoise(x, y) {
+    var s = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453;
+    return s - Math.floor(s);
+  }
+  function resetFx() {
+    fxTweens.length = 0;
+    fx.active = false; fx.clock = 0;
+    fx.gray = 0; fx.grayTintCh = 0; fx.grayLum = false; fx.sepia = 0; fx.invert = 0;
+    fx.invertR = 1; fx.invertG = 1; fx.invertB = 1; fx.invertClamp = false;
+    fx.hue = 0; fx.chromX = 0; fx.chromY = 0;
+    fx.colorR = 1; fx.colorG = 1; fx.colorB = 1; fx.addR = 0; fx.addG = 0; fx.addB = 0;
+    fx.lensStrength = 0; fx.lensSize = 0; fx.lensFade = 0; fx.lensOffX = 0; fx.lensOffY = 0; fx.lensTarget = 0; fx.lensChannel = 0; fx.lensAdd = false;
+    fx.radial = 0; fx.radialI = 0; fx.radialFade = 0; fx.radialOffX = 0; fx.radialOffY = 0; fx.radialTarget = 0; fx.radialOnlyEmpty = false;
+    fx.bulge = 0; fx.bulgeOffX = 0; fx.bulgeOffY = 0; fx.bulgeRadius = 0; fx.bulgeTarget = 0;
+    fx.swActive = false; fx.swTime = 0; fx.swInvert = false; fx.swTarget = 0; fx.swOffX = 0; fx.swOffY = 0;
+    fx.slActive = false; fx.slTime = 0; fx.slTarget = 0; fx.slOff = 0; fx.slAxis = false; fx.slDir = false; fx.slDual = false; fx.slFlip = false;
+    fx.swSpeed = 0; fx.swThick = 0; fx.swStrength = 0; fx.swWidth = 0; fx.swFadeIn = 0; fx.swFadeOut = 0; fx.swMin = 0; fx.swMax = 0; fx.swMaxDist = 0; fx.swTimeOff = 0;
+    fx.slSpeed = 0; fx.slThick = 0; fx.slStrength = 0; fx.slWidth = 0; fx.slFadeIn = 0; fx.slFadeOut = 0; fx.slMaxDist = 0; fx.slTimeOff = 0;
+    fx.cgEnabled = false; fx.cgTime = 0; fx.cgSpeed = 0; fx.cgRGB = 0; fx.cgYOff = 0; fx.cgStrength = 0; fx.cgHeight = 0; fx.cgLineFade = 0; fx.cgLineThick = 0; fx.cgFollow = false;
+    fx.glitch = 0; fx.pixX = 0; fx.pixY = 0; fx.pinchX = 0; fx.pinchY = 0; fx.splitR = 0; fx.splitC = 0;
+  }
+  function fxT(key, to, q) {
+    // reference _tweenShaderValue: duration 0 applies instantly, otherwise an eased tween
+    var dur = frames(q.dur), et = q.easingType || 0, er = q.easingRate === undefined || q.easingRate === null ? 2 : (q.easingRate > 0 ? q.easingRate : 2);
+    if (!q.dur || q.dur <= 0) { fx[key] = to; var i; for (i = fxTweens.length - 1; i >= 0; i--) if (fxTweens[i].key === key) fxTweens.splice(i, 1); return; }
+    var from = fx[key];
+    for (var j = fxTweens.length - 1; j >= 0; j--) if (fxTweens[j].key === key) fxTweens.splice(j, 1);
+    fxTweens.push({ key: key, from: from, to: to, t: 0, dur: dur, easingType: et, easingRate: er });
+    fx.active = true;
+  }
+  function fireShader(t) {
+    var q = t.p, fxn = q.fx;
+    fx.active = true;
+    if (fxn === 'layers') {
+      if (q.b192) resetFx();
+      return;
+    }
+    if (fxn === 'shockwave') {
+      // reference 2905: non-513 resets the clock/flags; 513 only re-tweens the values
+      if (!q.b513) {
+        fx.swTime = 0;
+        fx.swInvert = q.b184;
+        fx.swTarget = q.b188 ? (q.p1 ? -1 : q.p2 ? -2 : q.target) : 0;
+        fx.swOffX = q.v290 || 0; fx.swOffY = q.v291 || 0;
+      }
+      fx.swActive = true;
+      fx.swSpeed = q.v175; fx.swStrength = q.v176; fx.swThick = q.v180; fx.swWidth = q.v179;
+      fx.swFadeIn = q.v181; fx.swFadeOut = q.v182; fx.swMin = q.v191; fx.swMax = q.v189; fx.swMaxDist = q.v512; fx.swTimeOff = q.v177 || 0;
+      return;
+    }
+    if (fxn === 'shockline') {
+      if (!q.b513) {
+        fx.slTime = 0;
+        fx.slAxis = q.b186; fx.slDir = q.b185; fx.slDual = q.b187; fx.slFlip = q.b184;
+        fx.slTarget = q.b188 ? (q.p1 ? -1 : q.p2 ? -2 : q.target) : 0;
+        fx.slOff = q.v290 || 0;
+      }
+      fx.slActive = true;
+      fx.slSpeed = q.v175; fx.slStrength = q.v176; fx.slThick = q.v180; fx.slWidth = q.v179;
+      fx.slFadeIn = q.v181; fx.slFadeOut = q.v182; fx.slMaxDist = q.v512; fx.slTimeOff = q.v177 || 0;
+      return;
+    }
+    if (fxn === 'chromatic') {
+      if (q.b188) fxT('chromX', q.v180, q);
+      if (q.b190) fxT('chromY', q.v189, q);
+      return;
+    }
+    if (fxn === 'crt') {
+      if (!fx.cgEnabled) fx.cgTime = fx.clock;
+      fx.cgEnabled = !q.b192;
+      fx.cgFollow = q.b194;
+      fxT('cgSpeed', q.v175, q); fxT('cgHeight', 1 / Math.max(0.1, q.v189), q);
+      fxT('cgStrength', q.v176, q); fxT('cgLineFade', q.v179, q);
+      fxT('cgLineThick', q.v191, q); fxT('cgRGB', q.v180, q);
+      return;
+    }
+    if (fxn === 'grayscale') {
+      if (q.b190) fx.grayTintCh = q.target;
+      fx.grayLum = q.b188;
+      fxT('gray', q.v176, q);
+      return;
+    }
+    if (fxn === 'sepia') { fxT('sepia', q.v176, q); return; }
+    if (fxn === 'invert') {
+      if (q.b188) {
+        fx.invertClamp = q.b194;
+        if (q.b190) { fxT('invertR', q.v179, q); fxT('invertG', q.v180, q); fxT('invertB', q.v189, q); }
+        else { fx.invertR = q.v179; fx.invertG = q.v180; fx.invertB = q.v189; }
+      }
+      fxT('invert', q.v176, q);
+      return;
+    }
+    if (fxn === 'hue') { fxT('hue', q.v176, q); return; }
+    if (fxn === 'color') {
+      fxT('colorR', q.v175, q); fxT('colorG', q.v176, q); fxT('colorB', q.v191, q);
+      fxT('addR', q.v179, q); fxT('addG', q.v180, q); fxT('addB', q.v189, q);
+      return;
+    }
+    if (fxn === 'lens') {
+      fx.lensTarget = q.p1 ? -1 : q.p2 ? -2 : q.target;
+      fx.lensChannel = q.centerGroup;
+      fxT('lensStrength', Math.max(0, Math.min(1, q.v176)), q);
+      fxT('lensSize', q.v179, q); fxT('lensFade', q.v181, q);
+      fxT('lensOffX', q.v290 || 0, q); fxT('lensOffY', q.v291 || 0, q);
+      return;
+    }
+    if (fxn === 'radial') {
+      fx.radialTarget = q.b188 ? (q.p1 ? -1 : q.p2 ? -2 : q.target) : 0;
+      fx.radialOnlyEmpty = q.b513;
+      fxT('radial', q.v179, q); fxT('radialI', q.v176, q); fxT('radialFade', q.v181, q);
+      fxT('radialOffX', q.v290 || 0, q); fxT('radialOffY', q.v291 || 0, q);
+      return;
+    }
+    if (fxn === 'bulge') {
+      fx.bulgeTarget = q.b188 ? (q.p1 ? -1 : q.p2 ? -2 : q.target) : 0;
+      fxT('bulge', q.v176, q); fxT('bulgeOffX', q.v290 || 0, q); fxT('bulgeOffY', q.v291 || 0, q);
+      fxT('bulgeRadius', q.v180, q);
+      return;
+    }
+    if (fxn === 'glitch') { fx.glitch = q.v176; return; }
+    if (fxn === 'pixelate') { if (q.b188) fx.pixX = q.v180; if (q.b190) fx.pixY = q.v189; return; }
+    if (fxn === 'pinch') { fx.pinchX = q.v180; fx.pinchY = q.v189; return; }
+    if (fxn === 'split') { if (q.b188) fx.splitC = q.v180; if (q.b190) fx.splitR = q.v189; return; }
+    // motion (2915): stored but not rendered (Dash contains none)
+  }
+  function stepShaders(dtSec) {
+    if (!fx.active && !fxTweens.length) return;
+    fx.clock += dtSec;
+    var i, tw, f;
+    for (i = fxTweens.length - 1; i >= 0; i--) {
+      tw = fxTweens[i];
+      tw.t += dtSec * 60;
+      f = Math.min(1, tw.t / tw.dur);
+      fx[tw.key] = tw.from + (tw.to - tw.from) * easingSample(tw.easingType, tw.easingRate, f);
+      if (f >= 1) fxTweens.splice(i, 1);
+    }
+    if (fx.swActive) {
+      fx.swTime += fx.swSpeed * dtSec;
+      // the ring band leaves the screen: stop paying for it (reference keeps the uniform set,
+      // but the smoothstep window makes the contribution exactly zero past the diagonal)
+      var wS = fx.swThick <= 0.001 ? 0.0002 : fx.swThick * 0.2;
+      var tS = fx.swTime + fx.swTimeOff * 0.1;
+      var outerS = tS * (fx.swInvert ? 1 : tS) - fx.swFadeIn * wS;
+      if (outerS > 2.2) fx.swActive = false;
+    }
+    if (fx.slActive) {
+      fx.slTime += fx.slSpeed * dtSec;
+      var wL = fx.slThick <= 0.001 ? 0.0002 : fx.slThick * 0.2;
+      var tL = fx.slTime + fx.slTimeOff * 0.1;
+      if (fx.slFlip) tL = (fx.slDual ? 0.5 : 1) * (fx.slFadeOut * wL + wL + fx.slFadeIn * wL) - tL;
+      var outerL = tL - fx.slFadeIn * wL;
+      if (outerL > 2.2) fx.slActive = false;
+    }
+    if (fx.cgEnabled) {
+      var ct = fx.cgTime + fx.cgSpeed * dtSec;
+      fx.cgTime = Math.floor(ct) % 1000 + (ct - Math.floor(ct));
+    }
+    fx.active = fx.swActive || fx.slActive || fx.cgEnabled || fx.gray > 0 || fx.sepia > 0 || fx.invert > 0 ||
+      fx.hue !== 0 || fx.chromX !== 0 || fx.chromY !== 0 || fx.colorR !== 1 || fx.colorG !== 1 || fx.colorB !== 1 ||
+      fx.addR !== 0 || fx.addG !== 0 || fx.addB !== 0 || fx.lensStrength > 0 || fx.bulge > 0 || fx.radial !== 0;
+  }
+  function fxEnsure(w, h) {
+    if (!fxCvs) {
+      fxCvs = document.createElement('canvas'); fxCtx = fxCvs.getContext('2d');
+      fxCvsB = document.createElement('canvas'); fxCtxB = fxCvsB.getContext('2d');
+      fxFilterOK = typeof fxCtx.filter === 'string';
+    }
+    if (fxW !== w || fxH !== h) { fxW = w; fxH = h; fxCvs.width = w; fxCvs.height = h; fxCvsB.width = w; fxCvsB.height = h; }
+  }
+  // player-centred effects resolve their origin the same way as the reference _shaderScreenPos(-1)
+  function fxTargetPos(target) {
+    if (target === -1 && p && fxToS) { var c = fxToS(p.x, p.y); return [c.x / fxW, 1 - c.y / fxH]; }
+    if (target === -2 && p2 && fxToS) { var c2 = fxToS(p2.x, p2.y); return [c2.x / fxW, 1 - c2.y / fxH]; }
+    return null;
+  }
+  function drawFxIsolated(dst, src, srcCtx, r, g, b) {
+    // src * solid(rgb): multiply isolates a channel, destination-in restores the source alpha
+    // (without it the multiply fill would paint solid colour into transparent gaps)
+    dst.clearRect(0, 0, fxW, fxH);
+    dst.globalCompositeOperation = 'source-over';
+    dst.drawImage(src, 0, 0);
+    dst.globalCompositeOperation = 'multiply';
+    dst.fillStyle = 'rgb(' + r + ',' + g + ',' + b + ')';
+    dst.fillRect(0, 0, fxW, fxH);
+    dst.globalCompositeOperation = 'destination-in';
+    dst.drawImage(src, 0, 0);
+    dst.globalCompositeOperation = 'source-over';
+  }
+  function fxChromatic(g, src) {
+    // reference CHROMATIC: R at +offset, B at -offset, G in place
+    var dx = fx.chromX, dy = fx.chromY;
+    if (dx === 0 && dy === 0) return;
+    var ddx = Math.round(dx * 2), ddy = Math.round(dy * 2);
+    if (ddx === 0 && ddy === 0) return;
+    var saveA = g.globalAlpha, saveC = g.globalCompositeOperation;
+    drawFxIsolated(fxCtxB, fxCvs, fxCtx, 255, 0, 0);
+    g.globalCompositeOperation = 'lighter';
+    g.drawImage(fxCvsB, ddx, ddy);
+    drawFxIsolated(fxCtxB, fxCvs, fxCtx, 0, 255, 0);
+    g.drawImage(fxCvsB, 0, 0);
+    drawFxIsolated(fxCtxB, fxCvs, fxCtx, 0, 0, 255);
+    g.drawImage(fxCvsB, -ddx, -ddy);
+    g.globalCompositeOperation = saveC; g.globalAlpha = saveA;
+  }
+  function fxShockline(g, src) {
+    // reference SHOCKLINE: displacement field k*sin(dis*waves - time)*strength along a line
+    var w = fx.slThick <= 0.001 ? 0.0002 : fx.slThick * 0.2;
+    var fadeIn = fx.slFadeIn * w, fadeOut = fx.slFadeOut * w;
+    var t = fx.slTime + fx.slTimeOff * 0.1;
+    if (fx.slFlip) t = (fx.slDual ? 0.5 : 1) * (fadeOut + w + fadeIn) - t;
+    var outer = t - fadeIn;
+    var inner = Math.min(outer, outer - w);
+    var end = Math.min(inner, inner - fadeOut);
+    var waves = 22 / Math.max(0.001, fx.slWidth);
+    var t1 = fadeIn + outer + 0.001, t2 = outer, t3 = inner + 0.001, t4 = end;
+    var str = fx.slStrength * 0.01;
+    var center = 0.5 + fx.slOff * 0.5;
+    var aspect = fxH / fxW;
+    var maxDist = fx.slMaxDist !== 0 ? 1 / (fx.slMaxDist * 0.5) : 0;
+    var strips = FX_SL, sh = fxH / strips, i;
+    var y0, dis, k, a, dxPx, dyPx;
+    g.drawImage(src, 0, 0);              // clamp-to-edge base under the displaced strips
+    for (i = 0; i < strips; i++) {
+      y0 = Math.floor(i * sh);
+      dis = fx.slAxis ? (((1 - (y0 + sh * 0.5) / fxH) - center) * aspect) : ((y0 + sh * 0.5) / fxW - center);
+      if (maxDist !== 0) k = Math.max(0, Math.min(1, 1 + (dis < 0 ? 1 : -1) * dis * maxDist)); else k = 1;
+      if (fx.slDual) dis = dis < 0 ? -dis : dis;
+      if (fx.slDir) dis = 1 - dis;
+      k *= Math.max(0, Math.min(1, fxSmoothstep(t1, t2, dis) - fxSmoothstep(t3, t4, dis)));
+      if (k <= 0.0001) continue;
+      a = k * Math.sin(dis * waves - t) * str;
+      dxPx = a * fxW; dyPx = a * fxW;      // uv offset (1, 1/aspect) is equal in px on both axes
+      g.drawImage(src, 0, y0, fxW, sh, dxPx, y0 + dyPx, fxW, sh);
+    }
+  }
+  function fxShockwave(g, src) {
+    // reference SHOCKWAVE: radial ripple k*(p/dis)*sin(dis*waves - time)*strength around a centre
+    var w = fx.swThick <= 0.001 ? 0.0002 : fx.swThick * 0.2;
+    var fadeIn = fx.swFadeIn * w;
+    var t = fx.swTime + fx.swTimeOff * 0.1;
+    var outer = t * (fx.swInvert ? 1 : t) - fadeIn;
+    var inner = Math.min(outer, outer - w);
+    var end = Math.min(inner, inner - fx.swFadeOut * w);
+    var waves = 22 / Math.max(0.001, fx.swWidth);
+    var t1 = fadeIn + outer + 0.001, t2 = outer, t3 = inner + 0.001, t4 = end;
+    var str = fx.swStrength * 0.1;
+    var maxDist = fx.swMaxDist !== 0 ? 1 / (fx.swMaxDist * 0.5) : 0;
+    var minSize = fx.swMin * 0.5, maxSize = fx.swMax;
+    var pos = fxTargetPos(fx.swTarget);
+    var cx = pos ? pos[0] : 0.5 + fx.swOffX * 0.5, cy = pos ? pos[1] : 0.5 + fx.swOffY * 0.5;
+    var aspect = fxH / fxW;
+    var nx = FX_CELLS_X, ny = FX_CELLS_Y, cw = fxW / nx, ch = fxH / ny, ix, iy;
+    var x0, y0, mx, my, dis, k, ox, oy;
+    g.drawImage(src, 0, 0);              // clamp-to-edge base under the displaced cells
+    for (iy = 0; iy < ny; iy++) {
+      for (ix = 0; ix < nx; ix++) {
+        x0 = Math.floor(ix * cw); y0 = Math.floor(iy * ch);
+        mx = (x0 + cw * 0.5) / fxW - cx;
+        my = ((1 - (y0 + ch * 0.5) / fxH) - cy) * aspect;
+        dis = Math.sqrt(mx * mx + my * my);
+        if (dis < 0.0001) dis = 0.0001;
+        if (maxDist !== 0) k = Math.max(0, Math.min(1, 1 - dis * maxDist)); else k = 1;
+        if (fx.swInvert) dis = maxSize - Math.max(dis, minSize);
+        k *= Math.max(0, Math.min(1, fxSmoothstep(t1, t2, dis) - fxSmoothstep(t3, t4, dis)));
+        if (k <= 0.0001) continue;
+        ox = (mx / dis) * Math.sin(dis * waves - t) * str * k * fxW;
+        oy = (my / dis) * Math.sin(dis * waves - t) * str * k * fxW;
+        g.drawImage(src, x0, y0, cw, ch, x0 + ox, y0 - oy, cw, ch);
+      }
+    }
+  }
+  function fxBulge(g, src) {
+    // reference BULGE: screen radius r samples the source at tan(r*value)*value2
+    if (fx.bulge <= 0 || fx.bulgeRadius <= 0) return;
+    var pos = fxTargetPos(fx.bulgeTarget);
+    var cx = (pos ? pos[0] : 0.5 + fx.bulgeOffX * 0.5) * fxW;
+    var cy = (1 - (pos ? pos[1] : 0.5 + fx.bulgeOffY * 0.5)) * fxH;
+    var radius = fx.bulgeRadius * fxW;      // uv radius along x; screen radius in px
+    var rings = FX_RINGS, i, r0, r1, srcR0, srcR1, sc;
+    for (i = 0; i < rings; i++) {
+      r0 = radius * i / rings; r1 = radius * (i + 1) / rings;
+      // sample scale per ring: screen r shows source tan(r*v)*v2  =>  scale = r / srcR
+      srcR0 = Math.tan(r0 * fx.bulge) * fx.bulgeValue2;
+      srcR1 = Math.tan(r1 * fx.bulge) * fx.bulgeValue2;
+      sc = (r1 <= 0.01 || srcR1 <= 0.001) ? 1 : r1 / srcR1;
+      if (sc <= 0 || !isFinite(sc)) sc = 1;
+      g.save();
+      g.beginPath();
+      g.arc(cx, cy, r1, 0, Math.PI * 2);
+      if (r0 > 0) g.arc(cx, cy, r0, 0, Math.PI * 2, true);
+      g.clip();
+      g.translate(cx, cy);
+      g.scale(sc, sc);
+      g.translate(-cx, -cy);
+      g.drawImage(src, 0, 0);
+      g.restore();
+    }
+    // outside the radius the frame is unchanged
+    g.save();
+    g.beginPath();
+    g.rect(0, 0, fxW, fxH);
+    g.arc(cx, cy, radius, 0, Math.PI * 2, true);
+    g.clip();
+    g.drawImage(src, 0, 0);
+    g.restore();
+  }
+  function fxRadial(g, src) {
+    // reference RADIALBLUR: samples pulled toward the centre (zoom-copy approximation)
+    if (fx.radial === 0) return;
+    var pos = fxTargetPos(fx.radialTarget);
+    var cx = (pos ? pos[0] : 0.5 + fx.radialOffX * 0.5) * fxW;
+    var cy = (1 - (pos ? pos[1] : 0.5 + fx.radialOffY * 0.5)) * fxH;
+    var amp = fx.radial / 9 * 0.2;
+    var saveA = g.globalAlpha;
+    var i, s, e = FX_RAD_COPIES;
+    for (i = 1; i <= e; i++) {
+      s = 1 + amp * (i / e - 0.5) * 2;
+      if (s <= 0.01 || Math.abs(s - 1) < 0.004) continue;
+      g.save();
+      g.globalAlpha = saveA * 0.34;
+      g.translate(cx, cy); g.scale(s, s); g.translate(-cx, -cy);
+      g.drawImage(src, 0, 0);
+      g.restore();
+    }
+    g.globalAlpha = saveA;
+  }
+  function fxLens(g) {
+    // reference LENSCIRCLE: a tinted circle fading in from lensStart to lensEnd around an origin
+    if (fx.lensStrength <= 0) return;
+    var aspect = fxH / fxW;
+    var pos = fxTargetPos(fx.lensTarget);
+    var ox = pos ? pos[0] : 0.5 + fx.lensOffX * 0.5;
+    var oy = (pos ? pos[1] : 0.5 + fx.lensOffY * 0.5) * aspect;
+    var size = fx.lensSize, fade = Math.max(0, fx.lensFade);
+    var end = Math.max(0, size), start = Math.max(0, size - fade);
+    if (end <= start) return;
+    var tint = fx.lensChannel > 0 ? channelColor(fx.lensChannel) : '#000000';
+    var rgb = parseRGB(tint || '#000000');
+    var grad = g.createRadialGradient(ox * fxW, oy * fxH, 0, ox * fxW, oy * fxH, Math.max(1, end * fxW));
+    var col = function (rgbv, a) {
+      return 'rgba(' + Math.round(rgbv.r * 255) + ',' + Math.round(rgbv.g * 255) + ',' + Math.round(rgbv.b * 255) + ',' + a + ')';
+    };
+    grad.addColorStop(0, col(rgb, 0));
+    grad.addColorStop(Math.max(0.001, start / end), col(rgb, 0));
+    grad.addColorStop(1, col(rgb, fx.lensStrength));
+    var saveC = g.globalCompositeOperation;
+    if (fx.lensAdd) g.globalCompositeOperation = 'lighter';
+    g.fillStyle = grad;
+    g.fillRect(0, 0, fxW, fxH);
+    g.globalCompositeOperation = saveC;
+  }
+  function fxCrt(g, src, srcCtx) {
+    // reference CHROMATICGLITCH: per-scanline noise displacement + RGB offset + scanline dimming
+    var slices = FX_CG_SLICES, sh = fxH / slices, i, y0, cVal, disp, dxPx;
+    var yOff = fx.cgFollow ? -(playCamY || 0) / fxH : 0;
+    for (i = 0; i < slices; i++) {
+      y0 = Math.floor(i * sh);
+      cVal = ((y0 + sh * 0.5) / fxH + yOff) * 50 * fx.cgHeight;
+      disp = (fxNoise(fx.cgTime, cVal) - fxNoise(0, cVal)) * fx.cgStrength;
+      dxPx = disp * fxW;
+      g.drawImage(src, 0, y0, fxW, sh, dxPx, y0, fxW, sh);
+    }
+    if (fx.cgRGB !== 0) {
+      var off = fx.cgRGB * 2;
+      var saveC = g.globalCompositeOperation;
+      drawFxIsolated(fxCtxB, fxCvs, fxCtx, 255, 0, 0);
+      g.globalCompositeOperation = 'lighter';
+      g.drawImage(fxCvsB, -Math.round(off), 0);
+      drawFxIsolated(fxCtxB, fxCvs, fxCtx, 0, 0, 255);
+      g.drawImage(fxCvsB, Math.round(off), 0);
+      g.globalCompositeOperation = saveC;
+    }
+    if (fx.cgLineThick > 0) {
+      // color -= smoothstep(thick-0.01, thick+0.01, sin(y*300*height)) * lineStrength
+      var lt = Math.max(0.001, 1 - 0.2 * fx.cgLineFade);
+      var saveA = g.globalAlpha;
+      g.fillStyle = '#000';
+      for (i = 0; i < slices; i++) {
+        y0 = Math.floor(i * sh);
+        var sv = Math.sin(((y0 + sh * 0.5) / fxH + yOff) * 300 * fx.cgHeight);
+        var sst = fxSmoothstep(lt - 0.01, lt + 0.01, sv);
+        if (sst <= 0.001) continue;
+        g.globalAlpha = saveA * sst * fx.cgLineThick * 0.05;
+        g.fillRect(0, y0, fxW, sh);
+      }
+      g.globalAlpha = saveA;
+    }
+  }
+  function applyPostFX(g, toSFn) {
+    if (!fx.active || MONO) return;
+    var c = g.canvas;
+    if (!c || !c.width) return;
+    fxEnsure(c.width, c.height);
+    fxToS = toSFn;
+    // 1. snapshot the composed frame
+    fxCtx.clearRect(0, 0, fxW, fxH);
+    fxCtx.drawImage(c, 0, 0, fxW, fxH);
+    // 2. geometry passes paint the snapshot back through distortion strips/cells
+    g.clearRect(0, 0, fxW, fxH);
+    var displaced = false;
+    if (fx.swActive && fx.swStrength > 0) { fxShockwave(g, fxCvs); displaced = true; }
+    else if (fx.slActive && fx.slStrength > 0) { fxShockline(g, fxCvs); displaced = true; }
+    if (fx.bulge > 0) { fxBulge(g, fxCvs); displaced = true; }
+    // 3. chromatic needs the displaced frame as a bitmap: re-snapshot, then split channels
+    if ((fx.chromX !== 0 || fx.chromY !== 0) && displaced) {
+      fxCtx.clearRect(0, 0, fxW, fxH);
+      fxCtx.drawImage(c, 0, 0, fxW, fxH);
+      g.clearRect(0, 0, fxW, fxH);
+    }
+    if (fx.chromX !== 0 || fx.chromY !== 0) fxChromatic(g, fxCvs);
+    if (fx.radial !== 0) fxRadial(g, fxCvs);
+    if (fxFilterOK) {
+      var parts = '';
+      if (fx.gray > 0) parts += 'grayscale(' + Math.min(1, fx.gray).toFixed(3) + ') ';
+      if (fx.sepia > 0) parts += 'sepia(' + Math.min(1, fx.sepia).toFixed(3) + ') ';
+      if (fx.invert > 0) {
+        var iv = fx.invertClamp ? Math.min(1, fx.invert) : fx.invert;
+        parts += 'invert(' + Math.max(0, Math.min(1, iv)).toFixed(3) + ') ';
+      }
+      if (fx.hue !== 0) parts += 'hue-rotate(' + fx.hue.toFixed(2) + 'deg) ';
+      if (parts) g.filter = parts;
+    }
+    // color change (2923): multiply tint + additive term
+    if (fx.colorR !== 1 || fx.colorG !== 1 || fx.colorB !== 1) {
+      var mr = Math.max(0, Math.min(1, fx.colorR)), mg = Math.max(0, Math.min(1, fx.colorG)), mb = Math.max(0, Math.min(1, fx.colorB));
+      var saveC = g.globalCompositeOperation;
+      g.globalCompositeOperation = 'multiply';
+      g.fillStyle = 'rgb(' + Math.round(mr * 255) + ',' + Math.round(mg * 255) + ',' + Math.round(mb * 255) + ')';
+      g.fillRect(0, 0, fxW, fxH);
+      if (fx.colorR > 1 || fx.colorG > 1 || fx.colorB > 1) {
+        g.globalCompositeOperation = 'lighter';
+        g.globalAlpha = Math.min(0.5, (fx.colorR - 1) * 0.5);
+        g.drawImage(fxCvs, 0, 0);
+        g.globalAlpha = 1;
+      }
+      g.globalCompositeOperation = saveC;
+    }
+    if (fxFilterOK) g.filter = 'none';
+    if (fx.addR !== 0 || fx.addG !== 0 || fx.addB !== 0) {
+      var saveC2 = g.globalCompositeOperation;
+      g.globalCompositeOperation = 'lighter';
+      g.fillStyle = 'rgb(' + Math.round(fx.addR * 255) + ',' + Math.round(fx.addG * 255) + ',' + Math.round(fx.addB * 255) + ')';
+      g.fillRect(0, 0, fxW, fxH);
+      g.globalCompositeOperation = saveC2;
+    }
+    if (fx.lensStrength > 0) fxLens(g);
+    if (fx.cgEnabled) fxCrt(g, fxCvs, fxCtx);
+  }
   function renderPlay() {
     ctx.save();
     if (sidewaysNow()) reflectAbout(ctx, CW / 2, CH / 2);
@@ -2587,6 +3078,7 @@
     drawPlayerView(ctx, playToS, 2, p, false);
     if (p2) drawPlayerView(ctx, playToS, 2, p2, true);
     if (showHitboxes) drawHitboxes(LEVEL.sim());
+    applyPostFX(ctx, playToS);
     ctx.fillStyle = '#000';
     ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
     ctx.font = '15px Arial, sans-serif';
@@ -3167,6 +3659,7 @@
       groupInfo: function (g) { return groupInfo([g]); }, getGroupState: function () { return groupState; },
       getVisibleCount: function () { return visibleObjs(p ? p.x : 0).length; },
       camState: function () { return { zoom: camZoom, offX: camOffX, offY: camOffY, locked: camLocked, camX: camWorldX, camY: playCamY, angle: camAngle, edge: Object.assign({}, cameraEdges), freeMode: freeCameraMode, dirSign: playerNow() ? playerNow().dirSign : 1 }; },
+      fxState: function () { return Object.assign({}, fx, { tweens: fxTweens.length }); },
       emitGameplayEvent: emitGameplayEvent, getCheckpoint: function () { return checkpointState ? Object.assign({}, checkpointState) : null; },
       getLevel: function () { return LEVEL; }, setLevel: function (l) { LEVEL = l; levelIsDefault = false; snapshotPalette(); },
       // test hook: read/park the play camera Y (screen px, reference _cameraY semantics)
@@ -3192,10 +3685,13 @@
         if (p) {
           var guard = 0;
           while (guard++ < 20000) {
+            // sweep across the step so crossing triggers (move/colour/shader) fire like a live run
+            var nx = Math.min(x, p.x + p.speed * 0.9);
+            triggerSweep = { from: p.x, to: nx, y: p.y, dir: p.dirSign || 1 };
+            p.x = nx;
             frameNo++;
-            processTriggers(); processColourTriggers(); tickTweens(); tickCamera();
+            processTriggers(); processColourTriggers(); tickTweens(); tickCamera(); stepShaders(1 / 60);
             if (!p || p.dead || p.x >= x) break;
-            p.x = Math.min(x, p.x + p.speed * 0.9);
           }
           if (p) p.x = x;
           GameSim.refreshDyn(LEVEL.sim(), groupInfo);
