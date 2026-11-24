@@ -242,6 +242,12 @@ var GameSim = (function () {
       half: C.HALF, inner: C.INNER, isMini: false,
       robotAccel: 0, robotTouchedPad: false,
       onCeiling: false,
+      slopeRiding: false, slopeExitVel: null, slopeContactFrames: 0, slopeExitGrace: 0,
+      skipSlopeExit: false, slopeSnapped: false, slopeTangentThis: 0, slopeBlockedStep: false,
+      gdWasOnSlope: false, gdIsOnSlope: false, gdLastSlopeObj: null, gdLastSlopeTop: false,
+      gdLastSlopeUp: false, gdLastSlopeYPos: null, gdLastSlopeSteepness: 0, gdSlopeRotation: 0,
+      gdModeTick: -1e9, gdFlipTick: -1e9, prevSlopeAngle: 0, prevSlopeObj: null,
+      activeSlopeObj: null, activeSlopeAngle: 0, holdHeld: false, boostedThisStep: false,
       dead: false
     };
   }
@@ -281,6 +287,7 @@ var GameSim = (function () {
     flipGravity(p, flipped, mult);
   }
   function flipGravity(p, flipped, mult) {
+    p.gdFlipTick = p.tickN;                 // reference _gdFlipTick: slope crash grace after gravity flips
     if (p.flip === flipped) return;
     p.flip = flipped;
     p.vy *= (mult === undefined ? 0.5 : mult);
@@ -314,6 +321,7 @@ var GameSim = (function () {
     var flip = flipMod(p);
     if (p.canJump && hold) {
       p.vy = gdTrunc(flip * p.yStart * (p.isMini ? 0.8 : 1));
+      applySlopeJumpBoost(p);
       p.onGround = false; p.canJump = false; p.isJumping = true;
       p.orbHoldUsed = true;                     // the press is consumed: no orb buffering after a jump
       startRotate(p, 1);
@@ -418,6 +426,7 @@ var GameSim = (function () {
     if (pressed && p.canJump) {
       p.isJumping = true; p.onGround = false; p.canJump = false;
       p.vy = gdTrunc(flip * p.yStart * 0.5 * (p.isMini ? 0.8 : 1));
+      applySlopeJumpBoost(p);
       p.robotAccel = 0; p.robotTouchedPad = false;
       p.orbHoldUsed = true;                     // the press is consumed: no orb buffering after a robot jump
       return;
@@ -712,6 +721,183 @@ var GameSim = (function () {
   // the solid part of a slope only exists inside its bounding box
   function inBox(s, p, IN) { return p.y + IN > s.y0 && p.y - IN < s.y1; }
 
+  // ---- Web Dashers slope system (ported from player.js _handleSlopeCollision + _gdCubeSlopeCollision) ----
+  // This sim runs 1x world units; the reference runs 2x. Every size, window and velocity below is
+  // the reference value halved: playerSize 15, inner 4.5, wall box 4.5, stick 4/1, crash window 2,
+  // crest tolerance 20, push cap 2, wave hit 4.5. With the reference's gdCubeSlopes always enabled,
+  // every mode goes through the gd path: back wall, flat cap, then _gdCubeSlopeCollision; the wave
+  // dies on solid-side penetration before that (reference _handleSlopeCollision wave branch).
+  function slopeUphill(s) { return s.dir > 0; }
+  function gdSlopeGrace(p) { return p.tickN - p.gdModeTick < 24 || p.tickN - p.gdFlipTick < 24; }
+  function slopeLaunchMultiplier(angle) {
+    var acute = Math.atan(Math.abs(Math.tan(angle || 0)));
+    if (!(acute > 1e-6)) return 1.1 * 1.4;
+    return Math.min(0.8 / acute, 1.1) * 1.4;
+  }
+  function slopeExitScale(p) {
+    var held = (p.slopeContactFrames || 0) / 240;          // contact frames are 240 Hz substeps
+    var ramp = held < 0.1 ? Math.max(held / 0.1, 0.4) : 1;
+    var modeScale = (p.mode === 'ship' || p.mode === 'ufo' || p.mode === 'wave' || p.mode === 'swing' || p.mode === 'ball') ? 0.75 : 1;
+    return slopeLaunchMultiplier(p.prevSlopeAngle) * modeScale * ramp;
+  }
+  function applySlopeExitVelocity(p) {
+    if (p.slopeExitVel === null || p.slopeExitVel === undefined) return;
+    if (p.skipSlopeExit) return;
+    if (p.mode === 'wave') return;
+    if (p.isJumping && p.mode !== 'ship' && p.mode !== 'ufo' && p.mode !== 'wave') return;
+    var upSign = p.flip ? -1 : 1;
+    if (p.slopeExitVel * upSign < 0) {
+      if (p.holdHeld) return;
+      p.vy = Math.round(p.slopeExitVel * 1000) / 1000;
+      p.onGround = false;
+      p.canJump = false;
+      return;
+    }
+    var exitScale = slopeExitScale(p);
+    var exitCap = p.mode === 'swing' ? 6.5 : Infinity;
+    var exitVel = p.slopeExitVel * exitScale;
+    var dir = exitVel >= 0 ? 1 : -1;
+    if (exitVel * dir <= p.vy * dir) return;
+    p.vy = Math.max(-exitCap, Math.min(exitCap, Math.round(exitVel * 1000) / 1000));
+    p.onGround = false;
+    p.canJump = false;
+  }
+  // reference _applySlopeJumpBoost: a jump leaving a slope adds a quarter of the scaled exit velocity
+  function applySlopeJumpBoost(p) {
+    if (p.slopeExitVel === null || p.slopeExitVel === undefined) return;
+    var base = p.vy;
+    if (!base) return;
+    var dir = base >= 0 ? 1 : -1;
+    var contact = p.slopeExitVel * slopeExitScale(p);
+    if (contact * dir <= 0) return;
+    var cap = base * 1.4;
+    var v = base + contact * 0.25;
+    if (dir > 0) { if (v > cap) v = cap; } else { if (v < cap) v = cap; }
+    p.vy = v;
+  }
+  // reference _slopeBackWallHit: the vertical wall at the slope's tall end kills a player whose
+  // inner box runs into it while inside the solid region.
+  function slopeBackWallHit(p, s, px, py, surfaceY) {
+    if (!s.wallLeft) return false;
+    if (surfaceY !== null && surfaceY !== undefined) {
+      var solidBelow = !s.above;
+      var insideSolid = solidBelow ? py < surfaceY : py > surfaceY;
+      if (!insideSolid) return false;
+    }
+    var wallW = 1;
+    var wallL = s.x0;
+    var wallR = wallL + wallW;
+    var inner = p.mode === 'wave' ? (p.isMini ? 1 : 1.5) : 4.5;
+    return (px + inner > wallL) && (px - inner < wallR) && (py + inner > s.y0) && (py - inner < s.y1);
+  }
+  // reference _slopeFlatCapLand: landing on the flat cap face of the slope's bounding box
+  function slopeFlatCapLand(p, s, px, py, lastY, size, add) {
+    if (p.mode === 'wave') return null;
+    if (px + size <= s.x0 || px - size >= s.x1) return null;
+    var capAtTop = !!s.solidAbove;
+    var gFlip = !!p.flip;
+    if (capAtTop === gFlip) return null;
+    var face = capAtTop ? s.y1 : s.y0;
+    var feet = capAtTop ? py - size : py + size;
+    var lastFeet = capAtTop ? lastY - size : lastY + size;
+    var falling = capAtTop ? (p.vy <= 0) : (p.vy >= 0);
+    if (!falling && !p.onGround) return null;
+    var crossed = capAtTop
+      ? (feet <= face && feet + add >= face && (lastFeet >= face || p.onGround))
+      : (feet >= face && feet - add <= face && (lastFeet <= face || p.onGround));
+    if (!crossed) return null;
+    return { landed: true, died: false, candidate: {
+      y: capAtTop ? face + size : face - size,
+      onCeiling: !capAtTop,
+      slopeAngle: 0, blocked: true } };
+  }
+  // reference _gdCubeSlopeCollision: the ride target, the on-slope state machine and the
+  // crash / grace / push windows, for every mode (the flyer / ball branches included).
+  function gdCubeSlopeCollision(p, s, px, py, lastY, add, holding) {
+    var none = { landed: false, died: false };
+    var upsideDown = !!p.flip;
+    var size = p.half;
+    if (px + size <= s.x0 || px - size >= s.x1 || py + size <= s.y0 || py - size >= s.y1) return none;
+    var lineY = slopeY(s, px);
+    if (lineY === null || isNaN(lineY)) return none;
+    var uphill = slopeUphill(s);
+    var isFloorTop = !!s.above;                      // reference: isFloorTop = !slopeSolidBelow = the solid-above flag
+    var slidingDown = upsideDown ? uphill : !uphill;
+    var wasOnSlope = !!p.gdWasOnSlope;
+    var lastSlopeUp = p.gdLastSlopeUp === true;
+    if (wasOnSlope && lastSlopeUp && slidingDown &&
+        p.gdLastSlopeTop === isFloorTop && p.gdLastSlopeTop === upsideDown) return none;
+    var steepness = (s.y1 - s.y0) / (s.x1 - s.x0);
+    if (wasOnSlope && lastSlopeUp && p.gdLastSlopeSteepness > steepness) return none;
+    var stick = slidingDown ? (wasOnSlope ? 4 : 1) : 0;
+    var rideHalf = size / (Math.cos(p.gdSlopeRotation || 0) || 1);
+    if (!wasOnSlope) {
+      if (!(py + size > s.y0 + 1 && py - size < s.y1 - 1)) return none;
+    } else if (!upsideDown ? (s.y1 < py - rideHalf - stick) : (s.y0 > py + rideHalf + stick)) return none;
+    var slopeAngle = Math.atan(steepness);
+    var offset = size / Math.cos(slopeAngle);
+    var slopeIntersection = wasOnSlope && p.gdLastSlopeObj !== s && p.gdLastSlopeTop !== isFloorTop;
+    var tolerance = slopeIntersection ? 20 * (p.isMini ? 0.6 : 1) : 0;
+    var target;
+    if (!isFloorTop) {                               // floor slope: ride above the line
+      var maxPos = size + s.y1 - tolerance;
+      target = lineY + offset - tolerance;
+      if (target >= maxPos) target = maxPos;
+      if (target <= s.y0) target = s.y0;
+    } else {                                         // ceiling slope: ride below the line
+      var minPos = s.y0 - size + tolerance;
+      target = lineY - offset + tolerance;
+      if (target <= minPos) target = minPos;
+      if (target >= s.y1) target = s.y1;
+    }
+    var ship = p.mode === 'ship', ufo = p.mode === 'ufo', wave = p.mode === 'wave';
+    var flyer = ship || ufo || wave;
+    if (upsideDown !== isFloorTop && flyer) {
+      var headStick = (slopeIntersection || slidingDown || !holding) ? 0 : (wasOnSlope ? 2 : 1);
+      var into = upsideDown ? py < target + headStick : py > target - headStick;
+      if (!into) return none;
+      if (slopeIntersection || wave) return { landed: false, died: true };
+      var fall = !holding && slidingDown;
+      return { landed: false, died: false, push: { y: target, fall: fall, head: !(fall && wasOnSlope) } };
+    }
+    if (upsideDown !== isFloorTop) {
+      var touching = upsideDown ? py < target : py > target;
+      if (!touching) return none;
+      var movingAway = isFloorTop ? p.vy < 0 : p.vy > 0;
+      if (movingAway) return none;
+      if (p.mode === 'ball') {
+        if (slopeIntersection) return { landed: false, died: true };
+        return { landed: false, died: false, push: { y: target, grace: false } };
+      }
+      var crash = upsideDown ? py + 2 < target : py - 2 > target;
+      if (!crash) return none;
+      if (gdSlopeGrace(p)) return { landed: false, died: false, push: { y: target, grace: true } };
+      return { landed: false, died: true };
+    }
+    var special = !slopeIntersection && slidingDown &&
+      (ship ? !holding : (ufo || wave) ? true : !p.isJumping);
+    var touching2 = upsideDown ? py > target : py < target;
+    var within = special && (upsideDown ? py > target - stick : py < target + stick);
+    if (within && !touching2 && ufo) within = upsideDown ? p.vy >= 0 : p.vy <= 0;
+    var collide = touching2 || within;
+    if (wave && holding && slidingDown) collide = false;
+    if (collide && wasOnSlope && p.gdLastSlopeYPos !== null && p.gdLastSlopeYPos !== undefined &&
+        Math.abs(p.gdLastSlopeYPos - target) < 1e-6) collide = false;
+    if (!collide) return none;
+    var wdAngle = s.dir > 0 ? Math.atan2(s.y1 - s.y0, s.x1 - s.x0) : Math.atan2(s.y0 - s.y1, s.x1 - s.x0);
+    var risingFast = upsideDown ? p.vy < -5 : p.vy > 5;
+    return { landed: true, died: false, candidate: {
+      y: target,
+      onCeiling: upsideDown,
+      slopeAngle: wdAngle,
+      tangent: Math.tan(wdAngle) * p.speed,
+      ride: true,
+      keepYVelocity: risingFast ? p.vy : null,
+      noGround: flyer && holding && !slidingDown,
+      gd: { obj: s, isFloorTop: isFloorTop, target: target, steepness: steepness, up: !slidingDown, rotation: slopeAngle }
+    } };
+  }
+
   // ---- collision ----
   // Rotated solid (reference rotated Collider): the player is tested in the box's frame. Death uses the inner box;
   // landing uses the face normal, pushed out along it. Returns 1 when the cube dies.
@@ -890,7 +1076,7 @@ var GameSim = (function () {
     if (hit >= 0 && hid !== p.padIdx) {
       p.padIdx = hid;
       var pid = aPads[hit].id;
-      if (pid !== 67 || p.tickN - p.lastBluePad >= 5) { if (pid === 67) p.lastBluePad = p.tickN; applyPad(p, pid, lv, out); }
+      if (pid !== 67 || p.tickN - p.lastBluePad >= 5) { if (pid === 67) p.lastBluePad = p.tickN; p.boostedThisStep = true; applyPad(p, pid, lv, out); }
     }
     else if (hit < 0) { p.padIdx = -1; }
 
@@ -909,6 +1095,7 @@ var GameSim = (function () {
           p.orbUsed[o._id] = 1;
           p.orbIdx = o._id;
           p.orbHoldUsed = true;
+          p.boostedThisStep = true;
           applyOrb(p, o.id, o.rot);
           break;
         }
@@ -927,47 +1114,64 @@ var GameSim = (function () {
     var wasOnGround = p.onGround, wasOnCeiling = p.onCeiling;
     p.onGround = false;
     p.onCeiling = false;
-    var onSlopeNow = false;
 
-    // slopes. A slope stands the player when it is on the side gravity pulls toward.
+    // ---- slopes (reference checkCollisions slope handling) ----
+    // The candidate is picked across all nearby slopes and applied after the solid pass, like
+    // the reference applies bestSlopeCandidate after its single collision loop.
+    p.gdWasOnSlope = !!p.gdIsOnSlope;
+    p.gdIsOnSlope = false;
+    p.onSlope = false;
+    var bestCand = null, bestObj = null;
+    var slopeKillPending = false, slopeSnapped = false, slopeTangentThis = 0, slopeBlocked = false;
+    var gamemodeAdd = p.mode === 'wave' ? 0 : (p.mode === 'ship' || p.mode === 'ufo' ? 6 : 10);
+    var holdNow = !!input.hold;
+    var boostedThisStep = p.boostedThisStep || false;
     for (i = 0; i < aSlopes.length; i++) {
       s = aSlopes[i];
       if (!(R > s.x0 && L < s.x1)) continue;
       if (p.mode === 'wave') {
-        var wExt = slopeExt(s, p.x - IN, p.x + IN, s.above);
-        if (inBox(s, p, IN) && wExt !== null && (s.above ? p.y + IN > wExt : p.y - IN < wExt) && !NOCLIP) { out.died = true; try { if (typeof window !== 'undefined') window.__killer = { k: 'site' + 6 }; } catch (e) { } return; }
+        // reference wave branch: die on solid-side penetration of the small hitbox
+        var wSurf = slopeY(s, p.x);
+        var wHalf = p.isMini ? 3 : 4.5;
+        if (wSurf !== null && !isNaN(wSurf) && !NOCLIP) {
+          var solidBelow = !s.above;
+          var wInside = solidBelow ? (p.y - wHalf < wSurf) : (p.y + wHalf > wSurf);
+          var wWall = slopeBackWallHit(p, s, p.x, p.y, wSurf);
+          if (wInside || wWall) { out.died = true; try { if (typeof window !== 'undefined') window.__killer = { k: 'slope-wave', x0: s.x0, x1: s.x1, y0: s.y0, y1: s.y1 }; } catch (e) { } return; }
+        }
         continue;
       }
-      var standable = s.above === p.flip;
-      if (standable) {
-        var ext = slopeExt(s, L, R, s.above);
-        if (ext !== null) {
-          // reference glues the player onto a continuing slope through crests/troughs
-          // (bestSlopeCandidate): while riding, snap to a slope within SNAP above OR below,
-          // instead of only touching it from the gravity side. Skipped while a jump is
-          // in flight so slope take-offs are not re-stuck to the ground.
-          var glue = p.onSlope && !p.isJumping;
-          var stands = s.above
-            ? (T > ext - 0.001 && T <= ext + C.SNAP && (p.vy >= 0 || p.onSlope)) ||
-              (glue && T > ext - C.SNAP && T < ext + C.SNAP)
-            : (B < ext + 0.001 && B >= ext - C.SNAP && (p.vy <= 0 || p.onSlope)) ||
-              (glue && B < ext + C.SNAP && B >= ext - C.SNAP);
-          if (stands) {
-            p.y = s.above ? ext - H : ext + H;
-            p.vy = p.speed * slopeSlope(s);     // carry the slope into the next substep (and the launch)
-            p.onGround = true; p.canJump = true; p.isJumping = false; p.rotActive = false;
-            onSlopeNow = true;
-            B = p.y - H; T = p.y + H;
-            continue;
-          }
-        }
+      var gdSurf = slopeY(s, p.x);
+      if (gdSurf !== null && !isNaN(gdSurf) && slopeBackWallHit(p, s, p.x, p.y, gdSurf)) {
+        slopeKillPending = true;
+        try { if (typeof window !== 'undefined') window.__killer = { k: 'slope-backwall', x0: s.x0, x1: s.x1, y0: s.y0, y1: s.y1 }; } catch (e) { }
+        continue;
       }
-      // not standing on it: penetration past the inner box is a death
-      var iExt = slopeExt(s, p.x - IN, p.x + IN, s.above);
-      if (inBox(s, p, IN) && iExt !== null && (s.above ? p.y + IN > iExt : p.y - IN < iExt) && !NOCLIP) { out.died = true; try { if (typeof window !== 'undefined') window.__killer = { k: 'site' + 7 }; } catch (e) { } return; }
+      var capLand = slopeFlatCapLand(p, s, p.x, p.y, p.lastY, H, gamemodeAdd);
+      if (capLand) {
+        var isBetterCap = !bestCand || (p.flip ? capLand.candidate.y < bestCand.y : capLand.candidate.y > bestCand.y);
+        if (isBetterCap) { bestCand = capLand.candidate; bestObj = s; }
+        continue;
+      }
+      var r = gdCubeSlopeCollision(p, s, p.x, p.y, p.lastY, gamemodeAdd, holdNow);
+      if (r.died) { slopeKillPending = true; continue; }
+      if (r.push) {
+        var _away = p.flip ? -1 : 1;
+        p.y = r.push.y;
+        if (r.push.grace || r.push.fall) {
+          if (p.vy * _away > -2) p.vy = -2 * _away;
+        } else if (r.push.head !== false && p.vy * _away > 0) {
+          p.vy = 0;
+        }
+        p.onGround = false;
+        continue;
+      }
+      if (r.landed && r.candidate) {
+        var cand = r.candidate;
+        var isBetter = !bestCand || (!p.flip ? cand.y > bestCand.y : cand.y < bestCand.y);
+        if (isBetter) { bestCand = cand; bestObj = s; }
+      }
     }
-    p.onSlope = onSlopeNow;
-
     // solid blocks. The wave lands on tops / ceilings like the other modes (the reference
     // lands a wave touching a surface); only a real side / head hit into the inner box kills it.
     // Reference wave solid size: waveHitSize (4.5 world, mini 3) with gamemodeAddition 0 — the
@@ -1006,9 +1210,14 @@ var GameSim = (function () {
           p.vy = 0;
           if (wLanded) p.onGround = true;
           if (wCeiling) p.onCeiling = true;
-        } else if (!NOCLIP && overlaps(p.x - PH, p.x + PH, p.y - PH, p.y + PH, s)) {
-          if (s.ref) out.breaks.push(s.ref);
-          else { try { if (typeof window !== 'undefined') window.__killer = { k: 'solidWave', x0: s.x0, x1: s.x1, y0: s.y0, y1: s.y1 }; } catch (e) { } out.died = true; return; }
+        } else if (!NOCLIP) {
+          // reference wave solid inner: waveHitSize/3 (1.5 world) — both the death and the
+          // breakable trigger use that tight box (player.js _0x55559d)
+          var wIn = p.isMini ? 1 : 1.5;
+          if (overlaps(p.x - wIn, p.x + wIn, p.y - wIn, p.y + wIn, s)) {
+            if (s.ref) out.breaks.push(s.ref);
+            else { try { if (typeof window !== 'undefined') window.__killer = { k: 'solidWave', x0: s.x0, x1: s.x1, y0: s.y0, y1: s.y1 }; } catch (e) { } out.died = true; return; }
+          }
         }
         B = p.y - H; T = p.y + H;
       }
@@ -1043,9 +1252,7 @@ var GameSim = (function () {
           p.ballNormal = (p.flip ? -1 : 1) * (p.mirrored ? -1 : 1);
         }
       } else {
-        if (!NOCLIP && (s.ref
-          ? overlaps(L, R, B, T, s)
-          : overlaps(p.x - IN, p.x + IN, p.y - IN, p.y + IN, s))) {
+        if (!NOCLIP && overlaps(p.x - IN, p.x + IN, p.y - IN, p.y + IN, s)) {
           if (s.ref) out.breaks.push(s.ref);
           else { try { if (typeof window !== 'undefined') window.__killer = { k: 'solid', x0: s.x0, x1: s.x1, y0: s.y0, y1: s.y1 }; } catch (e) { } out.died = true; return; }
         }
@@ -1061,7 +1268,55 @@ var GameSim = (function () {
         }
       }
       B = p.y - H; T = p.y + H;
+    }    if (bestCand && boostedThisStep) { p.skipSlopeExit = true; bestCand = null; bestObj = null; }
+    if (bestCand) {
+      var wasJumpingSlope = p.isJumping;
+      p.y = bestCand.y;
+      if (bestCand.noGround) {
+        var away2 = p.flip ? -1 : 1;
+        if (p.vy * away2 < 2) p.vy = 2 * away2;
+        p.onGround = false;
+      } else {
+        p.onGround = true; p.canJump = true; p.isJumping = false; p.rotActive = false;
+        if (p.mode === 'ball') {
+          if (!wasOnGround) p.rot = Math.round(p.rot / Math.PI) * Math.PI;
+          p.ballOpp = false; p.ballHitPad = false;
+          p.ballNormal = (p.flip ? -1 : 1) * (p.mirrored ? -1 : 1);
+        }
+        if (bestCand.keepYVelocity !== null && bestCand.keepYVelocity !== undefined) p.vy = bestCand.keepYVelocity;
+      }
+      var gd = bestCand.gd;
+      if (gd) {
+        p.gdIsOnSlope = true;
+        p.gdLastSlopeObj = gd.obj;
+        p.gdLastSlopeTop = gd.isFloorTop;
+        p.gdLastSlopeYPos = gd.target;
+        p.gdLastSlopeSteepness = gd.steepness;
+        p.gdLastSlopeUp = gd.up;
+        p.gdSlopeRotation = gd.rotation;
+      }
+      p.onCeiling = !!bestCand.onCeiling;
+      if (p.prevSlopeObj !== bestObj) p.slopeEntryX = p.x;
+      p.prevSlopeAngle = p.activeSlopeAngle || 0;
+      p.activeSlopeObj = bestObj;
+      p.activeSlopeAngle = bestCand.slopeAngle;
+      p.onSlope = true;
+      if (bestCand.blocked) {
+        slopeBlocked = true;
+      } else if (!wasJumpingSlope) {
+        slopeSnapped = true;
+        slopeTangentThis = bestCand.tangent;
+      }
+      B = p.y - H; T = p.y + H;
     }
+    if (slopeKillPending && !bestCand && !p.onGround) {
+      if (!NOCLIP) { try { if (typeof window !== 'undefined') window.__killer = { k: 'slope-kill', x: p.x, y: p.y, cand: !!bestCand, ground: p.onGround }; } catch (e) { } out.died = true; return; }
+    }
+    p.slopeSnapped = slopeSnapped;
+    p.slopeTangentThis = slopeTangentThis;
+    p.slopeBlockedStep = slopeBlocked;
+    p.boostedThisStep = false;
+
   }
 
   // Platformer-only horizontal collision. Classic mode remains on its original auto-run path.
@@ -1187,6 +1442,25 @@ var GameSim = (function () {
         p.y = p.flyCeil - flySize; p.vy = 0; p.onGround = false; p.onCeiling = true; p.canJump = true; p.isJumping = false;
       }
     }
+    // reference slope-exit bookkeeping (player.js, after the corridor clamps): a snapped
+    // substep arms the exit velocity; leaving the slope applies the launch impulse.
+    p.holdHeld = !!input.hold;
+    if (p.slopeSnapped) {
+      p.slopeContactFrames = p.slopeRiding ? (p.slopeContactFrames || 0) + 1 : 0;
+      p.slopeRiding = true;
+      p.slopeExitVel = p.slopeTangentThis;
+      p.slopeExitGrace = 20;
+    } else if (p.slopeRiding) {
+      p.slopeRiding = false;
+      if (!p.slopeBlockedStep) {
+        applySlopeExitVelocity(p);
+      }
+      p.slopeExitVel = null;
+    }
+    p.skipSlopeExit = false;
+    if (p.slopeExitGrace > 0 && !p.slopeRiding) p.slopeExitGrace--;
+    p.prevSlopeObj = p.activeSlopeObj;
+    p.prevSlopeAngle = p.activeSlopeAngle;
     // reference hitGround() clears the hold buffer on every landing: a held press that
     // already jumped (or landed) cannot activate orbs without a fresh press
     if (p.onGround || p.onCeiling) p.orbHoldUsed = true;
@@ -1205,6 +1479,7 @@ var GameSim = (function () {
 
   function setMode(p, mode, portalY) {
     p.dashing = false; p.dashVy = 0;
+    p.gdModeTick = p.tickN;                 // reference _gdModeTick: slope crash grace after mode changes
     // reference player.js enter*Mode: fly bounds centre on the PORTAL's y (portal.portalY ??
     // portal.y), not the player's y at the crossing — off-centre entries shift the band and
     // with it the camera lock (flyCameraTarget)
