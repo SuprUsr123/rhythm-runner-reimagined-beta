@@ -99,3 +99,48 @@ Compared the supplied build against the bundled Web Dashers reference object tab
 - Group rotation tweens now mark the dynamic scene dirty every frame, so objects are repositioned/redrawn throughout rotate-trigger animations instead of remaining at their starting pose.
 - Child sprites using `sawblade`, `dropRing`, or `gravJumpRing` frames now receive the same continuous spin as top-level sprites. Sawblade child sprites also use the black tint and mirrored half-turn layer used by Web Dashers.
 - Updated the `game.js` cache version to v18.
+
+
+## Web Dashers parity pass — slopes, breakables, wave-solid (this branch)
+
+Reference: `web-dashers/web-dashers.github.io` @ 7d7ce7d (upstream "fix spider slopes / dual / rotated collisions").
+
+### Slopes: full port of the reference system (replaces the previous independent slope model)
+- `sim.js` now ports `player.js _handleSlopeCollision` + `_gdCubeSlopeCollision` verbatim (halved to
+  1x units): the gd slope path runs for every mode (the reference always has gdCubeSlopes enabled) —
+  back-wall kill (`_slopeBackWallHit`), flat-cap landing (`_slopeFlatCapLand`), the ride target with
+  perpendicular offset (`size / cos(angle)`) clamped to the slope box, the on-slope state machine
+  (`_gdWasOnSlope` / `_gdLastSlope*`), crest/trough intersection tolerance (20), sliding-down stick
+  (4/1), the crash window (2) with the 24-tick mode/flip grace, ball push handling, flyer head-stick
+  and fall push, and the keepYVelocity fast-rise passthrough.
+- Slope exit velocity system: `_slopeExitVel` armed by every snapped substep, launch impulse
+  `_slopeLaunchMultiplier` (0.8/acute, cap 1.1, gain 1.4) with the 0.1 s contact ramp (floor 0.4) and
+  the fly-mode 0.75 scale, swing cap 6.5, plus the jump boost (`_applySlopeJumpBoost`, +25% of the
+  scaled exit velocity, cap base*1.4) on cube and robot jumps.
+- Wave slopes: die on solid-side penetration of the small hitbox (4.5, mini 3) or the back wall —
+  the reference wave branch (the slide branch is dead code with gdCubeSlopes on).
+- Slope records carry the reference slope-type flags: `gdSlopeType` / `gdSlopeSolidAbove` /
+  `gdSlopeWallOnLeft` ported into `level-model.js` (bitmask table incl. flipX/flipY/rot).
+- Candidate selection follows the reference: best candidate across all nearby slopes by gravity-side
+  height, applied after the solid pass; a slope kill only fires when nothing landed that step; orbs
+  and pads skip the slope snap on their boost step (`slopeBoostSkipSnap`).
+
+### Breakable blocks (obj 143, Electroman Adventures)
+- The break trigger now uses the inner hitbox (4.5) like the reference solid branch — previously the
+  full outer box broke blocks on grazes, so blocks broke as/after the player left them instead of on
+  real contact. Landing on the support face is still solid; any other inner-box contact breaks.
+- Wave vs solids: the death and breakable contact now use the reference wave inner (waveHitSize/3 =
+  1.5, mini 1) instead of the full wave hitbox.
+
+### Verification
+- `node --check` on every changed file; the 14 Force Block tests still pass; the 22-level load/step
+  smoke passes.
+- Same-input A/B against the reference (recorded Web Dashers macro frames replayed on this engine
+  through the real game.js): 201 frames of Clutterfunk and 144 frames of Hexagon Force match
+  frame-perfect (x, y, vy, mode, ground) until the reference bot's own death — including orbs, pads,
+  rotated-spike grazes and gravity portals.
+- Synthetic slope probes: 45-degree ride + crest launch (exit velocity = tangent x multiplier x ramp,
+  matches the reference formula), falling-slope ride from the extrapolated lead-in, back-wall kill
+  ordering (the ride lift outruns the wall exactly like the reference).
+- Breakable semantics probe: support-face stand = solid, side/underside inner contact = break on the
+  contact frame, outer-box grazes and neighbouring hover = nothing.
