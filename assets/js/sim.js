@@ -317,10 +317,18 @@ var GameSim = (function () {
     return false;
   }
 
+  // Floatier descent: the cube's gravity is reduced while it falls (not while it rises), so jump heights are
+  // unchanged and a platform below can be reached without a frame-perfect landing.
+  var CUBE_FALL_GRAVITY = 0.85;
+  function cubeGravity(p) {
+    // strictly descending only: the apex is unchanged
+    return p.vy * flipMod(p) < 0 ? gravityStrength(p) * CUBE_FALL_GRAVITY : gravityStrength(p);
+  }
   function cubeJump(p, dt, hold) {
     var flip = flipMod(p);
     if (p.canJump && hold) {
       p.vy = gdTrunc(flip * p.yStart * (p.isMini ? 0.8 : 1));
+      p.vy = gdTrunc(p.vy - p.grav * dt * flip);   // reference updateJump: the jump tick also runs gravity before the move
       applySlopeJumpBoost(p);
       p.onGround = false; p.canJump = false; p.isJumping = true;
       p.orbHoldUsed = true;                     // the press is consumed: no orb buffering after a jump
@@ -328,11 +336,11 @@ var GameSim = (function () {
       return;
     }
     if (p.isJumping) {
-      p.vy = gdTrunc(p.vy - gravityStrength(p) * dt * flip);
+      p.vy = gdTrunc(p.vy - cubeGravity(p) * dt * flip);
       if (falling(p)) { p.isJumping = false; p.onGround = false; }
     } else {
       if (falling(p)) p.canJump = false;
-      p.vy = gdTrunc(p.vy - gravityStrength(p) * dt * flip);
+      p.vy = gdTrunc(p.vy - cubeGravity(p) * dt * flip);
       if (p.flip) p.vy = Math.min(p.vy, 15); else p.vy = Math.max(p.vy, -15);
       if (fallingPastThreshold(p) && !p.rotActive) startRotate(p, 1);
     }

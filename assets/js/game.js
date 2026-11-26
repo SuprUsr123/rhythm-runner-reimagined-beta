@@ -363,8 +363,16 @@
       }
     } else {
       camWorldX = p.x;
+      // A rotated gameplay frame maps world Y onto the screen's horizontal axis. Follow
+      // that coordinate with the camera's Y offset; otherwise the player walks off the
+      // left/right edge while the camera keeps following the now-vertical world-X axis.
+      if (p.sideways) {
+        var sideTargetY = CH / 2 - GROUND_SY + 2 * camZoom * (p.y - camOffY);
+        var sideEase = 1 - Math.pow(0.9, frameScale * (freeCameraMode ? freeCamEasing : 1));
+        if (snap) playCamY = sideTargetY; else playCamY += (sideTargetY - playCamY) * sideEase;
+      }
       // The Camera Mode trigger can release the normal fly-corridor camera lock.
-      if (!freeCameraMode && CAM_LOCK_MODES[p.mode] && p.flyCeil !== null && p.flyCeil !== undefined) {
+      else if (!freeCameraMode && CAM_LOCK_MODES[p.mode] && p.flyCeil !== null && p.flyCeil !== undefined) {
         var fc = (p.flyFloor + p.flyCeil) / 2;
         var flyTarget = Math.max(0, 2 * fc - 320 + REF_O), flyFollow = 1 - Math.pow(0.9, frameScale);
         if (snap) playCamY = flyTarget; else playCamY += (flyTarget - playCamY) * flyFollow;
@@ -787,7 +795,10 @@
       }
       return;
     }
-    if (t.kind === 'shader') { fireShader(t); return; }
+    // Shader / particle-style 2.2 visual triggers are intentionally inert in this Canvas 2D build.
+    // Running the partial post-FX path here clears the composed frame and can leave a white
+    // viewport; keep these unsupported trigger IDs harmless instead of showing a broken effect.
+    if (t.kind === 'shader') return;
     if (!g) return;
     dynDirty = true;
     if (t.kind === 'stop') { stopGroup(g); return; }
@@ -818,7 +829,20 @@
     camWorldX = p ? p.x : 0; cameraStatic = null; cameraEdges = {}; freeCameraMode = false; freeCamEasing = 1; freeCamPadding = 0;
     rebuildGroupCenters();
     targetsCache = spawnTargets();
+    fireStartTriggers();
     startColourTriggers();
+  }
+  // Reference: triggers at or left of the start (checkAlphaTriggers: trig.x <= playerX) and spawn-triggered
+  // triggers (key 62) apply when the level starts. A sweep that only fires on crossing skips them, so a group
+  // hidden by a trigger left of the start stayed visible.
+  function fireStartTriggers() {
+    var list = LEVEL.sim().triggers, i, t, sx = p ? p.x : 0;
+    for (i = 0; i < list.length; i++) {
+      t = list[i];
+      if (trigFired[i] || t.kind === 'event' || t.kind === 'spawn') continue;
+      if (t.p.touch && !t.p.spawn) continue;
+      if (t.p.spawn || t.x <= sx) fireTriggerAt(i);
+    }
   }
   function spawnTargets() {
     var set = {};
@@ -850,20 +874,22 @@
     if (!used) return;
     // reference: rotate-gameplay triggers that are not real touches become positional when channels are used
     rots.forEach(function (t) { t.p.touch = !!t.p.realTouch; });
+    // Web Dashers sorts channel triggers on the gameplay travel axis.
     var dirOf = {};
     rots.slice().sort(function (x, y) { return x.left - y.left; }).forEach(function (t) {
-      if (!(t.p.targetChannel in dirOf)) dirOf[t.p.targetChannel] = t.p.move === 2 || t.p.move === 3;
+      if (!(t.p.targetChannel in dirOf)) dirOf[t.p.targetChannel] = t.p.move || 4;
     });
     chLists = new Map();
     for (b = 0; b < list.length; b++) {
       var tb = list[b];
       if (!(tb.p.channel > 0) || tb.p.touch) continue;
+      var moveDir = dirOf[tb.p.channel] || 4, axisY = moveDir === 1 || moveDir === 2;
       if (!chLists.has(tb.p.channel)) chLists.set(tb.p.channel, []);
-      chLists.get(tb.p.channel).push({ i: b, ord: tb.p.ord || 0, x: tb.left });
+      chLists.get(tb.p.channel).push({ i: b, ord: tb.p.ord || 0, x: tb.left, y: tb.y, axisY: axisY });
     }
     chLists.forEach(function (entries, ch) {
-      var rev = !!dirOf[ch];
-      entries.sort(function (x, y) { return x.ord - y.ord || (rev ? y.x - x.x : x.x - y.x) || x.i - y.i; });
+      var moveDir = dirOf[ch] || 4, rev = moveDir === 2 || moveDir === 3, axisY = moveDir === 1 || moveDir === 2;
+      entries.sort(function (x, y) { var xp = axisY ? x.y : x.x, yp = axisY ? y.y : y.x; return x.ord - y.ord || (rev ? yp - xp : xp - yp) || x.i - y.i; });
     });
     chActive = 0; chIdx = {}; chRev = {};
   }
@@ -877,8 +903,11 @@
       var idx = chIdx[chActive] || 0;
       if (idx >= entries.length) return;
       var e = entries[idx], et = list[e.i];
-      var rev = !!chRev[chActive];
-      if (rev ? et.left < p.x : p.x < et.left) return;
+      var rev = !!chRev[chActive], sideways = !!p.sideways;
+      // Channel cursor is world-X normally and world-Y in sideways gameplay,
+      // matching Web Dashers' playerWorldX/playerY and trigger x/y coordinates.
+      var pos = sideways ? p.y : p.x, threshold = sideways ? et.y : et.left;
+      if (rev ? threshold < pos : pos < threshold) return;
       chIdx[chActive] = idx + 1;
       fireTriggerAt(e.i);
     }
@@ -1003,7 +1032,8 @@
     frameNo += timeWarp;
     if (p) {
       var fromX = lastTriggerX === null ? p.x : lastTriggerX;
-      triggerSweep = { from: fromX, to: p.x, y: p.y, dir: LEVEL.platformer ? (p.x >= fromX ? 1 : -1) : (p.dirSign || 1) };
+      // Positional triggers are crossed along the actual world-X displacement. dirSign is only the intended horizontal travel direction; rotate-gameplay can move the player in a different world axis while gravity/collisions still change X. Using dirSign here drops camera exits, zoom resets, and colour triggers during those transitions.
+      triggerSweep = { from: fromX, to: p.x, y: p.y, dir: p.x > fromX ? 1 : (p.x < fromX ? -1 : 0) };
     } else triggerSweep = null;
     processTriggers();
     processColourTriggers();
@@ -1196,7 +1226,7 @@
     if (!ch || !canColor(o.id)) return false;
     if (ch >= 1005 && ch <= 1007) return true;
     if (LEVEL.legacyColor && ch === 1002) return true;
-    return !!CHANNEL_BLEND[ch];
+    return !!(CHANNEL_BLEND[ch] || (LEVEL.blendHeader && LEVEL.blendHeader[ch]));
   }
   // background and ground come from their own header channels (1000, 1001), never from object channels.
   // Unset channels use the reference ColorManager defaults: bg rgb(0,102,255), ground rgb(0,68,170)
@@ -1345,6 +1375,25 @@
     g.translate(a, b);
     g.fillStyle = pat;
     g.fillRect(x - a, y - b, w, h);
+    g.restore();
+    return true;
+  }
+
+  // Reference ground (level.js _buildGround): one tile per column, its top edge on the ground line, repeated only
+  // horizontally. The texture is not tiled downwards, so the band is drawn once at its own height.
+  function drawTintedRow(g, src, col, x, y, w, phaseX, maxH) {
+    if (!src || !col || w <= 0) return false;
+    var t = tintedCanvas(src, col) || src;
+    var pat = g.createPattern(t, 'repeat-x');
+    if (!pat && t !== src) { t = src; pat = g.createPattern(src, 'repeat-x'); }
+    if (!pat) return false;
+    var a = (phaseX !== undefined ? phaseX : x) % t.width;
+    var hgt = Math.min(t.height, maxH === undefined ? t.height : maxH);
+    g.save();
+    g.beginPath(); g.rect(x, y, w, hgt); g.clip();
+    g.translate(a, y);
+    g.fillStyle = pat;
+    g.fillRect(x - a, 0, w, hgt);
     g.restore();
     return true;
   }
@@ -2048,13 +2097,13 @@
       var gimg = texImage(groundFileOf(LEVEL));
       if (TEX_OK[groundFileOf(LEVEL)] && gimg.width) {
         // reference _buildGround: the tile's top edge sits on the ground line, world-locked (no parallax)
-        drewGround = drawTintedTiled(g, gimg, groundColor(), 0, groundTopY, CW, Math.max(0, CH - groundTopY), groundX, groundTopY);
+        drewGround = drawTintedRow(g, gimg, groundColor(), 0, groundTopY, CW, groundX, Math.max(0, CH - groundTopY));
         // reference setGround2Color: the darker inner pattern is ALWAYS drawn (channel 1009
         // copies the ground channel 1001 when unset), not only when the header carries 1009
         var g2 = texImage(ground2FileOf(LEVEL));
         var g2col = LEVEL.palette ? channelColor(1009) : null;
         if (g2col && TEX_OK[ground2FileOf(LEVEL)] && g2.width) {
-          drawTintedTiled(g, g2, g2col, 0, groundTopY, CW, Math.max(0, CH - groundTopY), groundX, groundTopY);
+          drawTintedRow(g, g2, g2col, 0, groundTopY, CW, groundX, Math.max(0, CH - groundTopY));
         }
       }
     }
@@ -2629,6 +2678,7 @@
     fx.glitch = 0; fx.pixX = 0; fx.pixY = 0; fx.pinchX = 0; fx.pinchY = 0; fx.splitR = 0; fx.splitC = 0;
   }
   function fxT(key, to, q) {
+    if (typeof to !== 'number' || !isFinite(to)) to = 0;   // missing trigger fields must not reach the renderer as undefined/NaN
     // reference _tweenShaderValue: duration 0 applies instantly, otherwise an eased tween
     var dur = frames(q.dur), et = q.easingType || 0, er = q.easingRate === undefined || q.easingRate === null ? 2 : (q.easingRate > 0 ? q.easingRate : 2);
     if (!q.dur || q.dur <= 0) { fx[key] = to; var i; for (i = fxTweens.length - 1; i >= 0; i--) if (fxTweens[i].key === key) fxTweens.splice(i, 1); return; }
@@ -2940,9 +2990,9 @@
     var pos = fxTargetPos(fx.lensTarget);
     var ox = pos ? pos[0] : 0.5 + fx.lensOffX * 0.5;
     var oy = (pos ? pos[1] : 0.5 + fx.lensOffY * 0.5) * aspect;
-    var size = fx.lensSize, fade = Math.max(0, fx.lensFade);
+    var size = isFinite(fx.lensSize) ? fx.lensSize : 0, fade = isFinite(fx.lensFade) ? Math.max(0, fx.lensFade) : 0;
     var end = Math.max(0, size), start = Math.max(0, size - fade);
-    if (end <= start) return;
+    if (!(end > start) || !isFinite(end) || !isFinite(start)) return;
     var tint = fx.lensChannel > 0 ? channelColor(fx.lensChannel) : '#000000';
     var rgb = parseRGB(tint || '#000000');
     var grad = g.createRadialGradient(ox * fxW, oy * fxH, 0, ox * fxW, oy * fxH, Math.max(1, end * fxW));
@@ -3485,9 +3535,17 @@
     ANIM_MS += now - lastAnim; lastAnim = now;
     acc += dtms;
     var frames = 0;
-    while (acc >= FRAME_MS && frames < 4 && !frozen) { acc -= FRAME_MS; frames++; advanceFrame(); }
-    if (activeTab === 'edit') { panEditor(frames > 0 ? frames : 0.5); renderEdit(); }
-    else if (dirty || status === 'play') { renderPlay(); dirty = false; }
+    try {
+      while (acc >= FRAME_MS && frames < 4 && !frozen) { acc -= FRAME_MS; frames++; advanceFrame(); }
+      if (activeTab === 'edit') { panEditor(frames > 0 ? frames : 0.5); renderEdit(); }
+      else if (dirty || status === 'play') { renderPlay(); dirty = false; }
+    } catch (err) {
+      // log each distinct failure once and keep the loop alive (the next frame re-renders)
+      if (!loop._seen) loop._seen = {};
+      var key = String(err && err.message);
+      if (!loop._seen[key]) { loop._seen[key] = 1; if (window.console) console.error('frame error:', err); }
+      dirty = true;
+    }
     window.requestAnimationFrame(loop);
   }
 

@@ -794,7 +794,7 @@ var LevelModel = (function () {
     var parts = decoded.split(';'), objs = [], skipped = {}, n = 0, converted = 0;
     // colour channels from the header (kS29 = channel 1, kS30 = channel 2, ...), e.g. kS29,1_40_2_62_3_255
     var LEGACY_HEADER = { 29: 1000, 30: 1001, 31: 1002, 32: 1004, 33: 1, 34: 2, 35: 3, 36: 4, 37: 1003 };
-    var palette = {}, pm, palRe = /kS(\d+),1_(\d+)_2_(\d+)_3_(\d+)/g;
+    var palette = {}, blendHeader = {}, pm, palRe = /kS(\d+),1_(\d+)_2_(\d+)_3_(\d+)/g;
     while ((pm = palRe.exec(decoded)) !== null) {
       // kS29 = background (1000), kS30 = ground (1001), kS31..kS37 = 1002..1008 (1004 = default white)
       // Web Dashers' legacy header table: kS29 BG, kS30 G1, kS31 G2, kS32 default object colour, kS33..kS36 P1..P4, kS37 line
@@ -818,6 +818,8 @@ var LevelModel = (function () {
         var r = parseInt(f['1'] || '255', 10), g = parseInt(f['2'] || '255', 10), b = parseInt(f['3'] || '255', 10);
         if (isNaN(r) || isNaN(g) || isNaN(b)) return;
         chans[id] = [r, g, b];
+        // reference _channelBlending: key 5 of a header colour entry makes the channel additive
+        blendHeader[id] = f["5"] === "1";
       });
       Object.keys(chans).forEach(function (cid) {
         palette[parseInt(cid, 10)] = 'rgb(' + chans[cid].join(',') + ')';
@@ -878,7 +880,7 @@ var LevelModel = (function () {
         rec.p = { target: parseInt(d.k51 || '0', 10), dur: d.k10 === undefined ? 0 : (parseFloat(d.k10) || 0),
           dx: parseFloat(d.k28 || '0') || 0, dy: parseFloat(d.k29 || '0') || 0,
           opacity: d.k35 === undefined ? 1 : parseFloat(d.k35), activate: d.k56 === '1' ? 1 : 0,
-          touch: d.k11 === '1', multiTrigger: d.k87 === '1', delay: parseFloat(d.k63 || '0') || 0,
+          touch: d.k11 === '1', spawn: d.k62 === '1', multiTrigger: d.k87 === '1', delay: parseFloat(d.k63 || '0') || 0,
           easingType: parseInt(d.k30 || '0', 10) || 0, easingRate: d.k85 === undefined ? 2 : (parseFloat(d.k85) || 0) };
         if (id === 2066) {
           var gravityValue = d.k148 === undefined ? 1 : parseFloat(d.k148);
@@ -1040,6 +1042,7 @@ var LevelModel = (function () {
     // later objects replace earlier ones that cover the same cell (decorations are never replaced)
     var clean = new Level(objs);
     clean.palette = palette;
+    clean.blendHeader = blendHeader;
     clean.platformer = /(?:^|;)kA22,1(?:;|$)/.test(decoded);
     // background / ground texture selection (reference getBackgroundDisplayId / getGroundTextureId:
     // kA6/kA7 <= 1 mean texture 1) — consumed by the renderer's tiled bg / ground
